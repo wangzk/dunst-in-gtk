@@ -37,6 +37,8 @@ pub enum DbusEvent {
         client: Option<String>,
         /// -1 = use default, 0 = never expire, >0 = milliseconds.
         expire_timeout: i32,
+        /// From the `urgency` hint: 0 low, 1 normal, 2 critical.
+        urgency: u8,
     },
     /// Close a notification (e.g. via CloseNotification).
     Close { id: u32, reason: u32 },
@@ -83,7 +85,7 @@ impl Notifications {
         summary: String,
         body: String,
         _actions: Vec<String>, // action handling lands with mouse interaction
-        _hints: HashMap<String, Value<'_>>, // hints (urgency/value/...) land with state machine
+        _hints: HashMap<String, Value<'_>>,
         expire_timeout: i32,
         #[zbus(header)]
         hdr: Header<'_>,
@@ -91,8 +93,13 @@ impl Notifications {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.live_ids.lock().unwrap().insert(id);
         let client = hdr.sender().map(|s| s.to_string());
+        // The `urgency` hint (byte, 0-2) selects the style + default timeout.
+        let urgency = _hints
+            .get("urgency")
+            .and_then(|v| v.downcast_ref::<u8>().ok())
+            .unwrap_or(1);
 
-        log::info!("Notify id={} app={:?} summary={:?} timeout={}", id, app_name, summary, expire_timeout);
+        log::info!("Notify id={id} app={app_name:?} summary={summary:?} timeout={expire_timeout} urgency={urgency}");
         self.tx
             .try_send(DbusEvent::Show {
                 id,
@@ -102,6 +109,7 @@ impl Notifications {
                 body,
                 client,
                 expire_timeout,
+                urgency,
             })
             .expect("GTK main loop channel closed");
         id

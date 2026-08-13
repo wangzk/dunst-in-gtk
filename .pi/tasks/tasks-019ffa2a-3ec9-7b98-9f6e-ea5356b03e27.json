@@ -17,25 +17,25 @@
       "id": "2",
       "subject": "初始化 cargo 项目与依赖",
       "description": "cargo new dunst-in-gtk(目录已存在则 init), Cargo.toml 配置 gtk4, zbus 5, serde/serde_json, glib, log/env_logger 等依赖, 确认能编译通过。模块骨架: config / dbus / daemon / layout / window / main。",
-      "status": "in_progress",
+      "status": "completed",
       "activeForm": "初始化 cargo 项目与依赖",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066305,
-      "updatedAt": 1786609388604
+      "updatedAt": 1786610726646
     },
     {
       "id": "3",
       "subject": "实现 dunst 兼容 INI 配置解析",
       "description": "手写 INI 解析器(支持 ;/# 注释、引号、大小写不敏感键), 解析 global + urgency_low/normal/critical 段, 实现 L0+L1 相关键: font, geometry, gap_size, offset, corner_radius, background/foreground/frame 颜色, timeout/urgency, icons, markup, word_wrap, alignment, progress_bar, history_length, pause 等。带单元测试。",
-      "status": "pending",
+      "status": "in_progress",
       "activeForm": "实现 dunst 兼容 INI 配置解析",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066305,
-      "updatedAt": 1786609066305
+      "updatedAt": 1786610726647
     },
     {
       "id": "4",

@@ -9,6 +9,7 @@
 //! - D-Bus -> GTK: an async-channel; a task spawned on the glib main context
 //!   consumes it. GTK -> D-Bus: a cloned blocking connection.
 
+mod config;
 mod daemon;
 mod dbus;
 mod window;
@@ -18,6 +19,29 @@ use gtk4 as gtk;
 
 fn main() -> std::process::ExitCode {
     env_logger::init();
+
+    // `-config <path>` / `--config <path>` (dunst-compatible).
+    let mut cli_config = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-config" | "--config" => cli_config = args.next(),
+            "-h" | "--help" => {
+                println!("dunst-in-gtk: a dunst-compatible notification daemon (GTK4)");
+                println!("usage: dunst-in-gtk [-config <dunstrc>]");
+                return std::process::ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("dunst-in-gtk: unknown argument {other:?} (try --help)");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
+    let (config, warnings) = config::Config::load(cli_config.as_deref());
+    for w in &warnings {
+        log::warn!("{w}");
+    }
 
     if let Err(e) = gtk::init() {
         eprintln!("dunst-in-gtk: cannot initialize GTK (is DISPLAY set?): {e}");
@@ -32,7 +56,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
-    daemon::init(conn);
+    daemon::init(conn, std::sync::Arc::new(config));
 
     // D-Bus -> GTK event channel.
     let (tx, rx) = async_channel::unbounded::<dbus::DbusEvent>();

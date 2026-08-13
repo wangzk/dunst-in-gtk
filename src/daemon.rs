@@ -10,10 +10,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use crate::config::Config;
 use crate::dbus::DbusEvent;
-use crate::window::{emit_closed_signal, ClosedCb, NotificationWindow};
+use crate::window::{emit_closed_signal, ClosedCb, NotificationWindow, WindowStyle};
 
 // GTK-side daemon state. Lives in a thread-local: everything here is owned
 // and touched exclusively by the GTK main thread (windows are !Send).
@@ -30,10 +31,10 @@ pub fn connection() -> Option<&'static zbus::blocking::Connection> {
     CONN.get()
 }
 
-pub fn init(conn: zbus::blocking::Connection) {
+pub fn init(conn: zbus::blocking::Connection, config: Arc<Config>) {
     let _ = CONN.set(conn);
     DAEMON.with(|d| {
-        *d.borrow_mut() = Some(Daemon::new());
+        *d.borrow_mut() = Some(Daemon::new(config));
     });
 }
 
@@ -51,12 +52,14 @@ fn with_daemon<F: FnOnce(&mut Daemon)>(f: F) {
 
 pub struct Daemon {
     windows: HashMap<u32, NotificationWindow>,
+    config: Arc<Config>,
 }
 
 impl Daemon {
-    fn new() -> Self {
+    fn new(config: Arc<Config>) -> Self {
         Self {
             windows: HashMap::new(),
+            config,
         }
     }
 
@@ -70,6 +73,7 @@ impl Daemon {
                 body,
                 client,
                 expire_timeout,
+                urgency,
             } => self.show(
                 id,
                 &app_name,
@@ -78,6 +82,7 @@ impl Daemon {
                 &body,
                 client,
                 expire_timeout,
+                urgency,
             ),
             DbusEvent::Close { id, reason } => self.close(id, reason),
         }
@@ -92,12 +97,14 @@ impl Daemon {
         body: &str,
         client: Option<String>,
         expire_timeout: i32,
+        urgency: u8,
     ) {
         if self.windows.contains_key(&id) {
             log::warn!("duplicate notification id {id}, ignoring");
             return;
         }
 
+        let style = WindowStyle::from_config(&self.config, urgency);
         let on_closed: ClosedCb = Rc::new(RefCell::new(Box::new(|id| {
             with_daemon(|d| {
                 d.windows.remove(&id);
@@ -112,13 +119,20 @@ impl Daemon {
             body,
             client,
             on_closed,
+            &style,
         );
 
-        // Basic expiry; the full timeout state machine lands in ticket 05.
-        if expire_timeout > 0 {
+        // Timeout: explicit ms wins; -1 falls back to the urgency default
+        // (seconds, 0 = never). The full state machine lands in ticket 05.
+        let timeout_ms = if expire_timeout >= 0 {
+            expire_timeout as u64
+        } else {
+            self.config.urgency(urgency).timeout as u64 * 1000
+        };
+        if timeout_ms > 0 {
             let id = id;
             glib::timeout_add_local_once(
-                std::time::Duration::from_millis(expire_timeout as u64),
+                std::time::Duration::from_millis(timeout_ms),
                 move || {
                     log::info!("notification {id} expired");
                     with_daemon(|d| d.close(id, 1));
