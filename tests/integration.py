@@ -92,7 +92,11 @@ def close_notification(conn, nid):
     conn.send_and_get_reply(msg, timeout=10)
 
 
-def wait_until_name_owned(conn, timeout=5.0):
+def wait_until_name_owned(conn, timeout=5.0, pid=None):
+    """Wait until org.freedesktop.Notifications has an owner; when `pid` is
+    given, additionally require that the owner process is that pid (a freshly
+    dead daemon's name lingers on the bus for a moment, which would otherwise
+    fool the check)."""
     dbus = DBusAddress(
         "/org/freedesktop/DBus",
         bus_name="org.freedesktop.DBus",
@@ -100,14 +104,26 @@ def wait_until_name_owned(conn, timeout=5.0):
     )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        msg = new_method_call(
-            dbus, "GetNameOwner", "s", (NOTIF_IFACE,)
-        )
         try:
-            conn.send_and_get_reply(msg, timeout=2)
-            return True
+            reply = conn.send_and_get_reply(
+                new_method_call(dbus, "GetNameOwner", "s", (NOTIF_IFACE,)), timeout=2
+            )
         except Exception:
             time.sleep(0.1)
+            continue
+        if pid is None:
+            return True
+        owner = reply.body[0]
+        try:
+            p = conn.send_and_get_reply(
+                new_method_call(dbus, "GetConnectionUnixProcessID", "s", (owner,)),
+                timeout=2,
+            )
+            if p.body[0] == pid:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.1)
     return False
 
 
@@ -127,7 +143,128 @@ def capture_notification_closed(conn, action, timeout=5.0):
     return (msg.body[0], msg.body[1])
 
 
-# ------------------------------------------------------------- daemon harness
+def window_geoms(title):
+    """[(x, y, w, h), ...] for every window whose title matches."""
+    geoms = []
+    for wid in xdotool_windows(title):
+        r = subprocess.run(
+            ["xdotool", "getwindowgeometry", "--shell", wid],
+            capture_output=True,
+            text=True,
+        )
+        kv = {}
+        for line in r.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k.strip()] = int(v)
+        if kv:
+            geoms.append((kv.get("X", -1), kv.get("Y", -1), kv.get("WIDTH", -1), kv.get("HEIGHT", -1)))
+    return geoms
+
+
+def wait_window_count(title, n, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(xdotool_windows(title)) == n:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def wait_window_geometry(title, n, timeout=5.0):
+    """Wait until `n` windows with real geometry exist; return their geoms.
+
+    A window that is realized but not yet configured reports (0, 0, 1, 1)
+    from xdotool, so we poll until the geometry is meaningful."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        geoms = window_geoms(title)
+        if len(geoms) == n and all(w > 1 and x >= 0 for (x, y, w, h) in geoms):
+            return geoms
+        time.sleep(0.1)
+    return window_geoms(title)
+
+
+LAYOUT_DUNSTRC = """
+[global]
+origin = top-right
+offset = (10, 10)
+gap_size = 8
+width = (200, 400)
+height = (0, 1000)
+"""
+
+
+def test_layout(binary, conn):
+    log("== test: corner stacking + reflow ==")
+    cfg_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-layout-dunstrc")
+    with open(cfg_path, "w") as f:
+        f.write(LAYOUT_DUNSTRC)
+    daemon = Daemon(binary, os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-layout.log"))
+    try:
+        daemon.start(args=["-config", cfg_path])
+        if not wait_until_name_owned(conn, timeout=5.0):
+            fail("layout daemon did not acquire the bus name")
+
+        nid_a = notify(conn, "itest", "First", "AAA", 5000)
+        geoms = wait_window_geometry("dunst-in-gtk itest", 1)
+        if len(geoms) != 1:
+            fail("first notification window missing")
+        x0, y0, w0, h0 = geoms[0]
+        if (x0, w0) != (1070, 200):
+            fail(f"expected top-right at x=1070 w=200 (1280-10-200), got {geoms}")
+
+        nid_b = notify(conn, "itest", "Second", "BBB", 5000)
+        geoms = wait_window_geometry("dunst-in-gtk itest", 2)
+        if len(geoms) != 2:
+            fail("second notification window missing")
+        geoms = sorted(geoms)
+        (xa, ya, wa, ha), (xb, yb, wb, hb) = geoms[0], geoms[1]
+        if ya >= yb:
+            fail(f"expected first above second, got {geoms}")
+        if xa != xb:
+            fail(f"expected right-aligned stack, got {geoms}")
+        if yb - ya != ha + 8:
+            fail(f"expected gap 8 between notifications, got {geoms}")
+
+        close_notification(conn, nid_a)
+        if not wait_window_count("dunst-in-gtk itest", 1):
+            fail("window count did not drop after close")
+        geoms = window_geoms("dunst-in-gtk itest")
+        if len(geoms) != 1 or geoms[0][1] != 10:
+            fail(f"expected reflow to y=10, got {geoms}")
+
+        close_notification(conn, nid_b)
+        if not wait_window_count("dunst-in-gtk itest", 0):
+            fail("second window did not close")
+    finally:
+        daemon.stop()
+    pass_(f"stacking + reflow verified (nid_a={nid_a} nid_b={nid_b})")
+
+
+def test_hidpi(binary, conn):
+    log("== test: HiDPI (GDK_SCALE=2) ==")
+    cfg_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-layout-dunstrc")
+    daemon = Daemon(binary, os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-hidpi.log"))
+    try:
+        daemon.start(args=["-config", cfg_path], env={"GDK_SCALE": "2"})
+        if not wait_until_name_owned(conn, timeout=5.0):
+            fail("hidpi daemon did not acquire the bus name")
+
+        notify(conn, "itest", "HiDPI", "scaled", 5000)
+        geoms = wait_window_geometry("dunst-in-gtk itest", 1)
+        if len(geoms) != 1:
+            fail("hidpi notification window missing")
+        x, y, w, h = geoms[0]
+        # 200 logical px -> 400 physical; offset 10 logical -> 20 physical.
+        if (w, x, y) != (400, 860, 20):
+            fail(f"expected physical (400, 860, 20) for logical 200@scale2, got {geoms}")
+    finally:
+        daemon.stop()
+    pass_("GDK_SCALE=2 doubles the physical size and offsets")
+
+
+
 
 class Daemon:
     def __init__(self, binary, log_path):
@@ -135,17 +272,20 @@ class Daemon:
         self.log_path = log_path
         self.proc = None
 
-    def start(self):
+    def start(self, args=None, env=None):
         self.log = open(self.log_path, "ab")
+        full_env = os.environ.copy()
+        if env:
+            full_env.update(env)
         self.proc = subprocess.Popen(
-            [self.binary],
+            [self.binary] + (args or []),
             stdout=self.log,
             stderr=subprocess.STDOUT,
-            env=os.environ.copy(),
+            env=full_env,
         )
         conn = open_dbus_connection(bus="SESSION")
         try:
-            if not wait_until_name_owned(conn, timeout=5.0):
+            if not wait_until_name_owned(conn, timeout=5.0, pid=self.proc.pid):
                 tail = self.log_tail()
                 fail(f"daemon did not acquire {NOTIF_IFACE}\n{tail}")
         finally:
@@ -237,11 +377,18 @@ def test_notify_send(daemon, conn):
     pass_("notify-send pops a window that expires")
 
 
-def test_name_conflict(binary):
+def test_name_conflict(binary, conn):
     log("== test: bus-name conflict ==")
-    proc = subprocess.run([binary], capture_output=True, timeout=10)
-    if proc.returncode != 0:
-        fail(f"second instance exited with {proc.returncode}")
+    holder = Daemon(binary, os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-nc.log"))
+    try:
+        holder.start()
+        if not wait_until_name_owned(conn, timeout=5.0):
+            fail("holder daemon did not acquire the bus name")
+        proc = subprocess.run([binary], capture_output=True, timeout=10)
+        if proc.returncode != 0:
+            fail(f"second instance exited with {proc.returncode}")
+    finally:
+        holder.stop()
     pass_("second daemon instance exits with code 0")
 
 
@@ -261,6 +408,7 @@ def test_sigterm(daemon):
 # --------------------------------------------------------------------- driver
 
 def run_tests(binary):
+    os.environ.setdefault("RUST_LOG", "debug")
     daemon = Daemon(binary, os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-test.log"))
     conn = open_dbus_connection(bus="SESSION")
     try:
@@ -268,7 +416,12 @@ def run_tests(binary):
         test_show_close(daemon, conn)
         test_expiry(daemon, conn)
         test_notify_send(daemon, conn)
-        test_name_conflict(binary)
+        # These tests run their own daemon, so free the bus name first.
+        daemon.stop()
+        test_layout(binary, conn)
+        test_hidpi(binary, conn)
+        test_name_conflict(binary, conn)
+        daemon.start()
         test_sigterm(daemon)
         log("")
         log("== all integration tests passed ==")

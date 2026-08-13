@@ -12,6 +12,7 @@
 mod config;
 mod daemon;
 mod dbus;
+mod layout;
 mod window;
 mod x11;
 

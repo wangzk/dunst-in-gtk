@@ -116,19 +116,24 @@ impl fmt::Display for Color {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Monitor {
     /// Number of the monitor, starting from 0.
     Number(i32),
-    /// Monitor name, e.g. "HDMI-1" (matched in the layout ticket).
-    #[allow(dead_code)]
-    Name(&'static str),
+    /// Monitor name, e.g. "HDMI-1" (matched against connector/description).
+    Name(String),
 }
 
 impl Monitor {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // reserved for follow-mode refinements
     pub fn is_number(&self, n: i32) -> bool {
         matches!(self, Monitor::Number(m) if *m == n)
+    }
+
+    /// Does this monitor spec match the given connector/description string?
+    #[allow(dead_code)] // daemon matches by connector directly
+    pub fn matches_name(&self, name: &str) -> bool {
+        matches!(self, Monitor::Name(n) if name.contains(n.as_str()))
     }
 }
 
@@ -325,7 +330,7 @@ pub fn parse(content: &str) -> (Config, Vec<String>) {
     let mut warnings = Vec::new();
 
     let mut section: &str = "";
-    let mut owned_section = String::new();
+    let mut owned_section: String;
     for (lineno, raw) in content.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -438,9 +443,7 @@ fn apply_global(g: &mut GlobalConfig, key: &str, value: &str) -> Result<(), Stri
             g.monitor = if value.chars().all(|c| c.is_ascii_digit()) {
                 Monitor::Number(parse_int(value)?)
             } else {
-                // Name matching is resolved in the layout ticket; store as-is.
-                warn_unimplemented("monitor by name", value);
-                Monitor::Number(0)
+                Monitor::Name(value.to_string())
             };
         }
         "follow" => g.follow = parse_follow(value)?,

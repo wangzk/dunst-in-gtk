@@ -46,25 +46,13 @@ fn intern_atom(conn: &xcb::Connection, name: &str) -> Option<x::Atom> {
         .map(|r: x::InternAtomReply| r.atom())
 }
 
-fn get_u32_prop(conn: &xcb::Connection, window: x::Window, prop: x::Atom) -> Option<u32> {
-    let cookie = conn.send_request(&x::GetProperty {
-        delete: false,
-        window,
-        property: prop,
-        r#type: x::ATOM_CARDINAL,
-        long_offset: 0,
-        long_length: 1,
-    });
-    let reply: x::GetPropertyReply = conn.wait_for_reply(cookie).ok()?;
-    reply.value::<u32>().first().copied()
-}
-
 fn get_text_prop(conn: &xcb::Connection, window: x::Window, prop: x::Atom) -> Option<String> {
+    // ATOM_ANY: _NET_WM_NAME is UTF8_STRING, WM_NAME is STRING; accept both.
     let cookie = conn.send_request(&x::GetProperty {
         delete: false,
         window,
         property: prop,
-        r#type: x::ATOM_STRING,
+        r#type: x::ATOM_ANY,
         long_offset: 0,
         long_length: 1024,
     });
@@ -73,9 +61,10 @@ fn get_text_prop(conn: &xcb::Connection, window: x::Window, prop: x::Atom) -> Op
     Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// Find the XIDs of our own top-level windows: those whose `_NET_WM_PID`
-/// matches our PID, falling back to a `_NET_WM_NAME` prefix match.
-fn find_our_windows(conn: &xcb::Connection, title_prefix: &str) -> Vec<x::Window> {
+/// Find the XID of our window with the exact `_NET_WM_NAME` title.
+/// Titles are unique per notification (the id is part of the title), so this
+/// targets exactly one window even when several notifications are up.
+fn find_our_windows(conn: &xcb::Connection, title: &str) -> Vec<x::Window> {
     let Some(setup) = conn.get_setup().roots().next() else {
         return vec![];
     };
@@ -84,21 +73,14 @@ fn find_our_windows(conn: &xcb::Connection, title_prefix: &str) -> Vec<x::Window
         return vec![];
     };
 
-    let my_pid = std::process::id();
-    let pid_atom = intern_atom(conn, "_NET_WM_PID");
     let name_atom = intern_atom(conn, "_NET_WM_NAME");
     let mut found = vec![];
-
     for &child in reply.children() {
-        let pid_match = pid_atom
-            .and_then(|a| get_u32_prop(conn, child, a))
-            .map(|pid| pid == my_pid)
-            .unwrap_or(false);
         let name_match = name_atom
             .and_then(|a| get_text_prop(conn, child, a))
-            .map(|name| name.starts_with(title_prefix))
+            .map(|name| name == title)
             .unwrap_or(false);
-        if pid_match || name_match {
+        if name_match {
             found.push(child);
         }
     }
@@ -113,9 +95,12 @@ pub fn apply_window_hints_and_position(
     width: u32,
     height: u32,
 ) {
+    // All inputs are logical (device-independent) pixels; the X server works
+    // in physical pixels, so scale by the surface's scale factor (HiDPI).
+    let scale = window.surface().map(|s| s.scale_factor()).unwrap_or(1).max(1);
+    let (x, y, width, height) = (x * scale, y * scale, width * scale as u32, height * scale as u32);
     with_conn(|conn| {
         let title = window.title().unwrap_or_default();
-        let title = format!("dunst-in-gtk{title}");
 
         // The window is realized but may not have its properties up yet; poll
         // briefly. This runs before present(), so there is no visible flicker.

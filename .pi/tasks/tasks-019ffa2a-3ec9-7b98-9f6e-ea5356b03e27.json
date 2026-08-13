@@ -29,13 +29,13 @@
       "id": "3",
       "subject": "实现 dunst 兼容 INI 配置解析",
       "description": "手写 INI 解析器(支持 ;/# 注释、引号、大小写不敏感键), 解析 global + urgency_low/normal/critical 段, 实现 L0+L1 相关键: font, geometry, gap_size, offset, corner_radius, background/foreground/frame 颜色, timeout/urgency, icons, markup, word_wrap, alignment, progress_bar, history_length, pause 等。带单元测试。",
-      "status": "in_progress",
+      "status": "completed",
       "activeForm": "实现 dunst 兼容 INI 配置解析",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066305,
-      "updatedAt": 1786610726647
+      "updatedAt": 1786611102014
     },
     {
       "id": "4",
@@ -63,15 +63,15 @@
     },
     {
       "id": "6",
-      "subject": "实现 layout 角落堆叠与显示器选择",
+      "subject": "实现 layout 角落堆叠与显示器选择（ticket 03，暂停中：集成测试 1 个竞态待修）",
       "description": "dunst 几何语义: WxH+X+Y 与 gravity(右上角等), gap_size, offset, monitor 选择(当前鼠标/焦点/编号), 多显示器每显示器独立堆叠。纯数学可单测。",
-      "status": "pending",
+      "status": "in_progress",
       "activeForm": "实现 layout 角落堆叠",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066306,
-      "updatedAt": 1786609066306
+      "updatedAt": 1786611485656
     },
     {
       "id": "7",

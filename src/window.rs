@@ -4,11 +4,10 @@
 //! hint NOTIFICATION + keep-above, undecorated, positioned programmatically.
 //! HiDPI handling is delegated entirely to GTK's per-window scale factor.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4 as gtk;
-use gtk4::gdk;
 use gtk4::pango;
 use gtk4::prelude::*;
 
@@ -27,12 +26,14 @@ pub struct WindowStyle {
     pub frame_width: i32,
     pub font: String,
     pub alignment: Alignment,
+    #[allow(dead_code)] // box packing refinement in a later ticket
     pub vertical_alignment: VerticalAlignment,
     pub padding: i32,
     pub h_padding: i32,
     pub word_wrap: bool,
     pub ellipsize: Ellipsize,
     pub markup: Markup,
+    #[allow(dead_code)] // applied to background alpha in from_config
     pub transparency: u8,
 }
 
@@ -128,6 +129,8 @@ pub struct NotificationWindow {
     /// The client this notification belongs to (for the closed signal).
     client: Option<String>,
     on_closed: ClosedCb,
+    /// Whether the window has been realized/hinted/presented yet.
+    presented: Cell<bool>,
 }
 
 impl NotificationWindow {
@@ -142,7 +145,9 @@ impl NotificationWindow {
         style: &WindowStyle,
     ) -> Self {
         let window = gtk::Window::new();
-        window.set_title(Some(&format!("dunst-in-gtk {app_name}")));
+        // The id makes the title unique so the X11 layer can target this
+        // exact window for positioning (siblings share the app name).
+        window.set_title(Some(&format!("dunst-in-gtk {app_name} [{id}]")));
         window.set_decorated(false);
         window.set_resizable(false);
         window.add_css_class("notification");
@@ -187,6 +192,7 @@ impl NotificationWindow {
             id,
             client,
             on_closed,
+            presented: Cell::new(false),
         };
 
         // User/WM-initiated close (WM_DELETE_WINDOW, alt+F4): dismissed (2).
@@ -202,7 +208,6 @@ impl NotificationWindow {
             glib::Propagation::Proceed
         });
 
-        nw.position_and_present();
         nw
     }
 
@@ -221,49 +226,49 @@ impl NotificationWindow {
         self.id
     }
 
-    /// Position at the top-right corner of the monitor containing the window
-    /// (full layout semantics land in ticket 03), then realize, apply X11
-    /// hints and present. The X11 calls run before the main loop iterates, so
-    /// the server sees position/hints before GTK's map request.
-    fn position_and_present(&self) {
+    /// Natural (unconstrained) content size in logical pixels.
+    pub fn natural_size(&self) -> (i32, i32) {
         let content = self.window.child().expect("window has a child");
-        let (_, natural_w, _, _) = content.measure(gtk::Orientation::Horizontal, -1);
-        let (_, natural_h, _, _) = content.measure(gtk::Orientation::Vertical, -1);
-        let (w, h) = (natural_w.max(1), natural_h.max(1));
-        self.window.set_default_size(w, h);
-
-        <gtk::Widget as gtk::prelude::WidgetExt>::realize(self.window.upcast_ref::<gtk::Widget>());
-
-        let (x, y) = self.corner_position(w, h);
-        crate::x11::apply_window_hints_and_position(&self.window, x, y, w as u32, h as u32);
-
-        self.window.present();
+        let (_, nw, _, _) = content.measure(gtk::Orientation::Horizontal, -1);
+        let (_, nh, _, _) = content.measure(gtk::Orientation::Vertical, -1);
+        (nw.max(1), nh.max(1))
     }
 
-    /// Top-right corner of the monitor the window landed on, minus a margin.
-    fn corner_position(&self, w: i32, _h: i32) -> (i32, i32) {
-        if let Some(display) = gdk::Display::default() {
-            if let Some(monitor) = display
-                .monitor_at_surface(self.window.surface().as_ref().unwrap())
-                .or_else(|| first_monitor(&display))
-            {
-                let geo = monitor.geometry();
-                let margin = 12;
-                let x = geo.x() + geo.width() - w - margin;
-                let y = geo.y() + margin;
-                return (x, y);
-            }
+    /// Natural height when wrapped to the given width (logical pixels).
+    pub fn height_for_width(&self, width: i32) -> i32 {
+        let content = self.window.child().expect("window has a child");
+        let (_, nh, _, _) = content.measure(gtk::Orientation::Vertical, width.max(1));
+        nh.max(1)
+    }
+
+    /// Apply the final geometry. The first call realizes the window, applies
+    /// the X11 EWMH hints and presents; later calls (reflows) only reposition
+    /// via the X11 configure request. All values are logical pixels; the X11
+    /// layer converts by the surface scale factor.
+    pub fn apply_geometry(&self, x: i32, y: i32, width: i32, height: i32) {
+        self.window.set_default_size(width.max(1), height.max(1));
+        if !self.presented.get() {
+            <gtk::Widget as gtk::prelude::WidgetExt>::realize(
+                self.window.upcast_ref::<gtk::Widget>(),
+            );
+            crate::x11::apply_window_hints_and_position(
+                &self.window,
+                x,
+                y,
+                width.max(1) as u32,
+                height.max(1) as u32,
+            );
+            self.window.present();
+            self.presented.set(true);
+        } else {
+            crate::x11::apply_window_hints_and_position(
+                &self.window,
+                x,
+                y,
+                width.max(1) as u32,
+                height.max(1) as u32,
+            );
         }
-        (0, 0)
-    }
-}
-
-fn first_monitor(display: &gdk::Display) -> Option<gdk::Monitor> {
-    let model = display.monitors();
-    if model.n_items() > 0 {
-        model.item(0).and_then(|o| o.downcast::<gdk::Monitor>().ok())
-    } else {
-        None
     }
 }
 
