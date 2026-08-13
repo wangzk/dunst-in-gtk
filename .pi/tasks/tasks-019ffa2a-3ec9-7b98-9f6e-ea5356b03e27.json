@@ -88,8 +88,8 @@
     {
       "id": "8",
       "subject": "集成测试（ticket 01-03 已建 7 项；i3 真机冒烟待最后）",
-      "description": "集成测试已随 ticket 01-08 全量建设并全绿（33 单测 + 17 项集成，含像素断言）。唯一剩余：用户 i3 真机冒烟（Xvfb 无法覆盖：真实桌面/多屏/Wayland 需用户验证）。",
-      "status": "in_progress",
+      "description": "集成测试全量通过（37 单测 + 17 项集成，含键盘导航菜单测试）；i3 真机冒烟完成（焦点/布局/悬停/半透明/粗体/左对齐/WM 无边框全部验证）。",
+      "status": "completed",
       "activeForm": "集成测试与冒烟",
       "metadata": {},
       "blocks": [],
