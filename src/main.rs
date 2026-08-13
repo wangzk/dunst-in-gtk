@@ -12,6 +12,7 @@
 mod config;
 mod daemon;
 mod dbus;
+mod icons;
 mod layout;
 mod queue;
 mod window;
@@ -60,16 +61,21 @@ fn main() -> std::process::ExitCode {
     };
     let counters = std::sync::Arc::new(daemon::DaemonCounters::default());
     let history = std::sync::Arc::new(daemon::HistoryStore::default());
+    // Gates the `body-markup` capability; kept in sync on ConfigReload.
+    let markup_cap = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        config.global.markup != config::Markup::No,
+    ));
     daemon::init(
         conn,
         std::sync::Arc::new(config),
         std::sync::Arc::clone(&counters),
         std::sync::Arc::clone(&history),
+        std::sync::Arc::clone(&markup_cap),
     );
 
     // D-Bus -> GTK event channel.
     let (tx, rx) = async_channel::unbounded::<dbus::DbusEvent>();
-    std::thread::spawn(move || dbus::serve(tx, counters, history));
+    std::thread::spawn(move || dbus::serve(tx, counters, history, markup_cap));
 
     let ctx = glib::MainContext::default();
     ctx.spawn_local(async move {

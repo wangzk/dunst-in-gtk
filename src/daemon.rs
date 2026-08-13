@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use gtk4::gdk;
 use gtk4::prelude::*;
 
-use crate::config::{Config, Follow, Monitor, MouseAction};
+use crate::config::{Config, Follow, Markup, Monitor, MouseAction};
 use crate::dbus::DbusEvent;
 use crate::layout::{resolve_size, stack_position, MonitorGeometry};
 use crate::queue::{NotifyAction, Pending, QueueState};
@@ -32,6 +32,8 @@ pub struct HistoryEntry {
     pub body: String,
     pub urgency: u8,
     pub expire_timeout: i32,
+    /// Progress 0-100 from the `value` hint; None = no progress bar.
+    pub value: Option<i32>,
     pub timestamp: u64,
     pub client: Option<String>,
 }
@@ -57,7 +59,9 @@ pub enum HistoryAction {
     Clear,
     Remove(u32),
 }
-use crate::window::{emit_action_invoked, emit_closed_signal, EventCb, NotificationWindow, WindowStyle};
+use crate::window::{
+    emit_action_invoked, emit_closed_signal, EventCb, NotificationContent, NotificationWindow, WindowStyle,
+};
 
 // GTK-side daemon state. Lives in a thread-local: everything here is owned
 // and touched exclusively by the GTK main thread (windows are !Send).
@@ -79,10 +83,11 @@ pub fn init(
     config: Arc<Config>,
     counters: Arc<DaemonCounters>,
     history: Arc<HistoryStore>,
+    markup: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let _ = CONN.set(conn);
     DAEMON.with(|d| {
-        *d.borrow_mut() = Some(Daemon::new(config, counters, history));
+        *d.borrow_mut() = Some(Daemon::new(config, counters, history, markup));
     });
 }
 
@@ -133,6 +138,8 @@ pub struct Daemon {
     history: Arc<HistoryStore>,
     counters: Arc<DaemonCounters>,
     config: std::sync::Arc<Config>,
+    /// Gates the `body-markup` capability; updated on ConfigReload.
+    markup: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Daemon {
@@ -140,6 +147,7 @@ impl Daemon {
         config: std::sync::Arc<Config>,
         counters: Arc<DaemonCounters>,
         history: Arc<HistoryStore>,
+        markup: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let limit = config.global.notification_limit;
         Self {
@@ -149,6 +157,7 @@ impl Daemon {
             history,
             counters,
             config,
+            markup,
         }
     }
 
@@ -239,6 +248,7 @@ impl Daemon {
                     client: entry.client,
                     expire_timeout: entry.expire_timeout,
                     urgency: entry.urgency,
+                    value: entry.value,
                 };
                 match self.queue.notify(&pending) {
                     NotifyAction::ShowNow => self.create_window_from(pending),
@@ -281,9 +291,18 @@ impl Daemon {
         for id in windows {
             if let Some((nw, pending)) = self.windows.get(&id) {
                 let style = WindowStyle::from_config(&new_cfg, pending.urgency);
-                nw.update_content(&pending.summary, &pending.body, &style);
+                let content = NotificationContent {
+                    app_icon: pending.app_icon.clone(),
+                    summary: pending.summary.clone(),
+                    body: pending.body.clone(),
+                    value: pending.value,
+                };
+                nw.update_content(&content, &style);
             }
         }
+        let markup_enabled = new_cfg.global.markup != Markup::No;
+        self.markup
+            .store(markup_enabled, std::sync::atomic::Ordering::Relaxed);
         *std::sync::Arc::make_mut(&mut self.config) = new_cfg;
         self.relayout();
         log::info!("config reloaded");
@@ -431,6 +450,7 @@ impl Daemon {
                 body: pending.body,
                 urgency: pending.urgency,
                 expire_timeout: pending.expire_timeout,
+                value: pending.value,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -459,6 +479,7 @@ impl Daemon {
                 client,
                 expire_timeout,
                 urgency,
+                value,
             } => self.show(
                 id,
                 &app_name,
@@ -469,6 +490,7 @@ impl Daemon {
                 client,
                 expire_timeout,
                 urgency,
+                value,
             ),
             DbusEvent::Close { id, reason } => self.close(id, reason),
             DbusEvent::SetPauseLevel(level) => self.set_pause_level(level),
@@ -488,6 +510,7 @@ impl Daemon {
         client: Option<String>,
         expire_timeout: i32,
         urgency: u8,
+        value: Option<i32>,
     ) {
         let pending = Pending {
             id,
@@ -499,6 +522,7 @@ impl Daemon {
             client: client.clone(),
             expire_timeout,
             urgency,
+            value,
         };
 
         // replaces_id: update in place (waiting or displayed) instead of
@@ -520,7 +544,14 @@ impl Daemon {
                 slot.app_icon = app_icon.to_string();
                 slot.expire_timeout = expire_timeout;
                 slot.client = client.clone();
-                nw.update_content(summary, body, &style);
+                slot.value = value;
+                let content = NotificationContent {
+                    app_icon: app_icon.to_string(),
+                    summary: summary.to_string(),
+                    body: body.to_string(),
+                    value,
+                };
+                nw.update_content(&content, &style);
                 hovered = nw.is_hovered();
             }
             self.arm_timeout(id, timeout_ms);
@@ -545,15 +576,18 @@ impl Daemon {
 
     fn create_window_from(&mut self, pending: Pending) {
         let id = pending.id;
-        let (app_name, app_icon, summary, body, actions, client, timeout_ms) = (
+        let (app_name, actions, client, timeout_ms) = (
             pending.app_name.clone(),
-            pending.app_icon.clone(),
-            pending.summary.clone(),
-            pending.body.clone(),
             pending.actions.clone(),
             pending.client.clone(),
             self.timeout_ms(pending.expire_timeout, pending.urgency),
         );
+        let content = NotificationContent {
+            app_icon: pending.app_icon.clone(),
+            summary: pending.summary.clone(),
+            body: pending.body.clone(),
+            value: pending.value,
+        };
         let style = WindowStyle::from_config(&self.config, pending.urgency);
         let on_event: EventCb = Rc::new(RefCell::new(Box::new(|event| {
             with_daemon(|d| d.handle_window_event(event));
@@ -561,9 +595,7 @@ impl Daemon {
         let nw = NotificationWindow::new(
             id,
             &app_name,
-            &app_icon,
-            &summary,
-            &body,
+            &content,
             actions,
             client,
             on_event,
@@ -610,6 +642,7 @@ impl Daemon {
                 body: pending.body,
                 urgency: pending.urgency,
                 expire_timeout: pending.expire_timeout,
+                value: pending.value,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())

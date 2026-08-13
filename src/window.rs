@@ -12,7 +12,7 @@ use gtk4::pango;
 use gtk4::prelude::*;
 
 use crate::config::{
-    Alignment, Color, Config, Ellipsize, Markup, VerticalAlignment,
+    Alignment, Color, Config, Ellipsize, IconPosition, Markup, VerticalAlignment,
 };
 use crate::dbus::{DBUS_IFACE, DBUS_PATH};
 
@@ -35,6 +35,18 @@ pub struct WindowStyle {
     pub markup: Markup,
     #[allow(dead_code)] // applied to background alpha in from_config
     pub transparency: u8,
+    // ---- icons (ticket 07)
+    pub icons: bool,
+    pub icon_position: IconPosition,
+    pub min_icon_size: i32,
+    pub max_icon_size: i32,
+    pub text_icon_padding: i32,
+    // ---- progress bar (ticket 07)
+    pub progress_bar: bool,
+    pub progress_bar_height: i32,
+    pub progress_bar_frame_width: i32,
+    pub progress_bar_min_width: i32,
+    pub progress_bar_max_width: i32,
 }
 
 impl WindowStyle {
@@ -58,6 +70,16 @@ impl WindowStyle {
             ellipsize: cfg.global.ellipsize,
             markup: cfg.global.markup,
             transparency: cfg.global.transparency,
+            icons: cfg.global.icons,
+            icon_position: cfg.global.icon_position,
+            min_icon_size: cfg.global.min_icon_size,
+            max_icon_size: cfg.global.max_icon_size,
+            text_icon_padding: cfg.global.text_icon_padding,
+            progress_bar: cfg.global.progress_bar,
+            progress_bar_height: cfg.global.progress_bar_height,
+            progress_bar_frame_width: cfg.global.progress_bar_frame_width,
+            progress_bar_min_width: cfg.global.progress_bar_min_width,
+            progress_bar_max_width: cfg.global.progress_bar_max_width,
         }
     }
 }
@@ -69,6 +91,44 @@ pub fn style_css(style: &WindowStyle) -> String {
     let bg = style.background.css_rgba();
     let fg = style.foreground.css_rgba();
     let frame = style.frame_color.css_rgba();
+    let fw = style.frame_width.max(0);
+    let radius = style.corner_radius.max(0);
+    let mut progress = String::new();
+    if style.progress_bar {
+        // dunst: progress_bar_frame_width defaults to frame_width when unset;
+        // a negative value means "inherit" in the config, clamp to >= 0.
+        let pfw = if style.progress_bar_frame_width >= 0 {
+            style.progress_bar_frame_width
+        } else {
+            fw
+        };
+        let mut rules = String::new();
+        if style.progress_bar_height > 0 {
+            rules.push_str(&format!("min-height: {}px;", style.progress_bar_height));
+        }
+        if style.progress_bar_min_width > 0 {
+            rules.push_str(&format!("min-width: {}px;", style.progress_bar_min_width));
+        }
+        if style.progress_bar_max_width > 0 {
+            rules.push_str(&format!("max-width: {}px;", style.progress_bar_max_width));
+        }
+        progress = format!(
+            r#"
+window.notification progressbar.progress {{
+    {rules}
+}}
+window.notification progressbar trough {{
+    background-color: transparent;
+    border: {pfw}px solid {frame};
+    border-radius: 0;
+}}
+window.notification progressbar progress {{
+    background-color: {fg};
+    border-radius: 0;
+}}
+"#
+        );
+    }
     format!(
         r#"
 window.notification {{
@@ -76,15 +136,13 @@ window.notification {{
 }}
 window.notification > box.notification {{
     background-color: {bg};
-    border: {}px solid {frame};
-    border-radius: {}px;
+    border: {fw}px solid {frame};
+    border-radius: {radius}px;
 }}
 window.notification label {{
     color: {fg};
 }}
-"#,
-        style.frame_width.max(0),
-        style.corner_radius.max(0)
+{progress}"#
     )
 }
 
@@ -150,11 +208,37 @@ pub fn emit_action_invoked(
     }
 }
 
+/// The renderable content of one notification.
+#[derive(Debug, Clone)]
+pub struct NotificationContent {
+    /// Icon name or file path; the `image-path` hint has already been
+    /// resolved into this (dunst replaces `app_icon` with it).
+    pub app_icon: String,
+    pub summary: String,
+    pub body: String,
+    /// Progress 0-100 from the `value` hint; None = no progress bar.
+    pub value: Option<i32>,
+}
+
+/// Remove every child of a container widget (GTK4 has no `children()`;
+/// walk `first_child` and unparent instead).
+fn clear_children(container: &gtk::Widget) {
+    while let Some(child) = container.first_child() {
+        child.unparent();
+    }
+}
+
 pub struct NotificationWindow {
     window: gtk::Window,
     summary_label: gtk::Label,
     body_label: gtk::Label,
     font_attrs: pango::AttrList,
+    /// The app name, used for the missing-icon placeholder letter.
+    app_name: String,
+    /// Holds the current icon widget; rebuilt on content updates.
+    icon_slot: gtk::Box,
+    /// Holds the progress bar; empty when there is no `value` hint.
+    progress_slot: gtk::Box,
     id: u32,
     /// The client this notification belongs to (for the closed signal).
     client: Option<String>,
@@ -174,9 +258,7 @@ impl NotificationWindow {
     pub fn new(
         id: u32,
         app_name: &str,
-        _app_icon: &str,
-        summary: &str,
-        body: &str,
+        content: &NotificationContent,
         actions: Vec<(String, String)>,
         client: Option<String>,
         on_event: EventCb,
@@ -203,27 +285,53 @@ impl NotificationWindow {
         font_attrs.insert(pango::AttrFontDesc::new(&font_desc));
 
         let summary_label = gtk::Label::new(None);
-        summary_label.set_markup(&format!("<b>{}</b>", render_text(style.markup, summary)));
+        summary_label.set_markup(&format!(
+            "<b>{}</b>",
+            render_text(style.markup, &content.summary)
+        ));
         summary_label.set_halign(align_of(style.alignment));
         summary_label.set_attributes(Some(&font_attrs));
 
         let body_label = gtk::Label::new(None);
-        body_label.set_markup(&render_text(style.markup, body));
+        body_label.set_markup(&render_text(style.markup, &content.body));
         body_label.set_halign(align_of(style.alignment));
         body_label.set_wrap(style.word_wrap);
         body_label.set_ellipsize(ellipsize_of(style.ellipsize));
         body_label.set_attributes(Some(&font_attrs));
 
-        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        box_.add_css_class("notification");
-        box_.set_margin_top(style.padding);
-        box_.set_margin_bottom(style.padding);
-        box_.set_margin_start(style.h_padding);
-        box_.set_margin_end(style.h_padding);
-        box_.append(&summary_label);
-        box_.append(&body_label);
+        // Text column: summary, body, then the progress-bar slot.
+        let text_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        text_box.append(&summary_label);
+        text_box.append(&body_label);
+        let progress_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        text_box.append(&progress_slot);
 
-        window.set_child(Some(&box_));
+        // Icon slot next to (or above) the text, per `icon_position`.
+        let icon_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let child: gtk::Widget = if style.icons && style.icon_position != IconPosition::Off {
+            let orientation = match style.icon_position {
+                IconPosition::Left | IconPosition::Right => gtk::Orientation::Horizontal,
+                IconPosition::Top | IconPosition::Off => gtk::Orientation::Vertical,
+            };
+            let content_box = gtk::Box::new(orientation, style.text_icon_padding.max(0));
+            if style.icon_position == IconPosition::Right {
+                content_box.append(&text_box);
+                content_box.append(&icon_slot);
+            } else {
+                content_box.append(&icon_slot);
+                content_box.append(&text_box);
+            }
+            content_box.add_css_class("notification");
+            content_box.upcast()
+        } else {
+            text_box.add_css_class("notification");
+            text_box.upcast()
+        };
+        child.set_margin_top(style.padding);
+        child.set_margin_bottom(style.padding);
+        child.set_margin_start(style.h_padding);
+        child.set_margin_end(style.h_padding);
+        window.set_child(Some(&child));
 
         let hovered = Rc::new(Cell::new(false));
         let nw = Self {
@@ -231,6 +339,9 @@ impl NotificationWindow {
             summary_label,
             body_label,
             font_attrs,
+            app_name: app_name.to_string(),
+            icon_slot,
+            progress_slot,
             id,
             client,
             actions,
@@ -239,6 +350,7 @@ impl NotificationWindow {
             hovered: Rc::clone(&hovered),
             popover: RefCell::new(None),
         };
+        nw.set_icon_and_progress(content, style);
 
         // User/WM-initiated close (WM_DELETE_WINDOW, alt+F4). The daemon
         // decides (signal + bookkeeping); we just report. Daemon-initiated
@@ -348,8 +460,7 @@ impl NotificationWindow {
     }
 
     /// Update the content in place (replaces_id) and re-apply the style.
-    /// The daemon reflows afterwards (the size may change).
-    pub fn update_content(&self, summary: &str, body: &str, style: &WindowStyle) {
+    pub fn update_content(&self, content: &NotificationContent, style: &WindowStyle) {
         let css = gtk::CssProvider::new();
         css.load_from_data(&style_css(style));
         self.window
@@ -358,14 +469,41 @@ impl NotificationWindow {
 
         self.summary_label.set_attributes(Some(&self.font_attrs));
         self.body_label.set_attributes(Some(&self.font_attrs));
-        self.summary_label
-            .set_markup(&format!("<b>{}</b>", render_text(style.markup, summary)));
+        self.summary_label.set_markup(&format!(
+            "<b>{}</b>",
+            render_text(style.markup, &content.summary)
+        ));
         self.summary_label.set_halign(align_of(style.alignment));
         self.body_label
-            .set_markup(&render_text(style.markup, body));
+            .set_markup(&render_text(style.markup, &content.body));
         self.body_label.set_halign(align_of(style.alignment));
         self.body_label.set_wrap(style.word_wrap);
         self.body_label.set_ellipsize(ellipsize_of(style.ellipsize));
+        self.set_icon_and_progress(content, style);
+    }
+
+    /// Rebuild the icon and progress-bar widgets for the current content
+    /// (both live in slots so replaces_id updates can swap them).
+    fn set_icon_and_progress(&self, content: &NotificationContent, style: &WindowStyle) {
+        clear_children(self.icon_slot.upcast_ref::<gtk::Widget>());
+        if let Some(icon) = crate::icons::icon_widget(
+            &content.app_icon,
+            &self.app_name,
+            style,
+            &WidgetExt::display(&self.window),
+        ) {
+            self.icon_slot.append(&icon);
+        }
+
+        clear_children(self.progress_slot.upcast_ref::<gtk::Widget>());
+        let Some(value) = content.value.filter(|_| style.progress_bar) else {
+            return;
+        };
+        let bar = gtk::ProgressBar::new();
+        bar.set_fraction((value.clamp(0, 100) as f64) / 100.0);
+        bar.set_halign(gtk::Align::Start);
+        bar.add_css_class("progress");
+        self.progress_slot.append(&bar);
     }
 
     /// Whether the pointer is currently inside the window.
@@ -464,6 +602,16 @@ mod tests {
             ellipsize: Ellipsize::Middle,
             markup: Markup::Full,
             transparency: 0,
+            icons: true,
+            icon_position: IconPosition::Left,
+            min_icon_size: 32,
+            max_icon_size: 64,
+            text_icon_padding: 8,
+            progress_bar: true,
+            progress_bar_height: 10,
+            progress_bar_frame_width: 1,
+            progress_bar_min_width: 150,
+            progress_bar_max_width: 300,
         }
     }
 
@@ -475,6 +623,24 @@ mod tests {
         assert!(css.contains("rgba(255, 0, 0, 1.000)"), "{css}");
         assert!(css.contains("border: 2px solid"), "{css}");
         assert!(css.contains("border-radius: 12px"), "{css}");
+    }
+
+    #[test]
+    fn progress_css_contains_configured_bounds() {
+        let css = style_css(&style());
+        assert!(css.contains("min-height: 10px;"), "{css}");
+        assert!(css.contains("min-width: 150px;"), "{css}");
+        assert!(css.contains("max-width: 300px;"), "{css}");
+        assert!(css.contains("progressbar trough"), "{css}");
+        assert!(css.contains("border-radius: 0;"), "{css}");
+    }
+
+    #[test]
+    fn no_progress_css_when_disabled() {
+        let mut s = style();
+        s.progress_bar = false;
+        let css = style_css(&s);
+        assert!(!css.contains("progressbar"), "{css}");
     }
 
     #[test]

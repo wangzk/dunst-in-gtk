@@ -28,6 +28,8 @@ pub struct Pending {
     pub client: Option<String>,
     pub expire_timeout: i32,
     pub urgency: u8,
+    /// Progress 0-100 from the `value` hint; None = no progress bar.
+    pub value: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +169,7 @@ mod tests {
             client: None,
             expire_timeout: 5000,
             urgency: 1,
+            value: None,
         }
     }
 

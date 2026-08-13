@@ -10,7 +10,7 @@
 //! emission goes through a cloned `blocking::Connection` on the GTK thread.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::daemon::{CmdAction, DaemonCounters, HistoryAction, HistoryStore};
@@ -45,6 +45,8 @@ pub enum DbusEvent {
         expire_timeout: i32,
         /// From the `urgency` hint: 0 low, 1 normal, 2 critical.
         urgency: u8,
+        /// From the `value` hint (0-100): progress-bar value, None = none.
+        value: Option<i32>,
     },
     /// Close a notification (e.g. via CloseNotification).
     Close { id: u32, reason: u32 },
@@ -64,14 +66,19 @@ pub struct Notifications {
     tx: async_channel::Sender<DbusEvent>,
     next_id: AtomicU32,
     live_ids: Mutex<HashSet<u32>>,
+    /// Whether `markup` is enabled in the config: gates the `body-markup`
+    /// capability (dunst declares it conditionally too). Shared with the
+    /// GTK thread so ConfigReload can flip it.
+    markup: Arc<AtomicBool>,
 }
 
 impl Notifications {
-    pub fn new(tx: async_channel::Sender<DbusEvent>) -> Self {
+    pub fn new(tx: async_channel::Sender<DbusEvent>, markup: Arc<AtomicBool>) -> Self {
         Self {
             tx,
             next_id: AtomicU32::new(1),
             live_ids: Mutex::new(HashSet::new()),
+            markup,
         }
     }
 
@@ -97,7 +104,7 @@ impl Notifications {
         summary: String,
         body: String,
         actions: Vec<String>,
-        _hints: HashMap<String, Value<'_>>,
+        hints: HashMap<String, Value<'_>>,
         expire_timeout: i32,
         #[zbus(header)]
         hdr: Header<'_>,
@@ -120,12 +127,32 @@ impl Notifications {
             })
             .collect();
         // The `urgency` hint (byte, 0-2) selects the style + default timeout.
-        let urgency = _hints
+        let urgency = hints
             .get("urgency")
             .and_then(|v| v.downcast_ref::<u8>().ok())
             .unwrap_or(1);
+        // The `value` hint (int or uint) drives the progress bar; negative
+        // means "no progress" (dunst stores -1 for absent).
+        let value = hints.get("value").and_then(|v| match v {
+            Value::I32(i) => Some(*i),
+            Value::U32(i) => Some(*i as i32),
+            _ => None,
+        });
+        let value = value.filter(|v| *v >= 0).map(|v| v.min(100));
+        // `image-path` / `image_path` overrides `app_icon`, exactly like
+        // dunst replaces iconname from these hints.
+        let mut app_icon = app_icon;
+        if let Some(path) = hint_string(&hints, "image-path")
+            .or_else(|| hint_string(&hints, "image_path"))
+        {
+            if !path.is_empty() {
+                app_icon = path;
+            }
+        }
 
-        log::info!("Notify id={id} app={app_name:?} summary={summary:?} timeout={expire_timeout} urgency={urgency}");
+        log::info!(
+            "Notify id={id} app={app_name:?} summary={summary:?} timeout={expire_timeout} urgency={urgency} value={value:?}"
+        );
         self.tx
             .try_send(DbusEvent::Show {
                 id,
@@ -137,10 +164,12 @@ impl Notifications {
                 client,
                 expire_timeout,
                 urgency,
+                value,
             })
             .expect("GTK main loop channel closed");
         id
     }
+
 
     async fn close_notification(&self, id: u32) {
         log::info!("CloseNotification id={}", id);
@@ -153,8 +182,18 @@ impl Notifications {
     }
 
     async fn get_capabilities(&self) -> Vec<String> {
-        // Honest subset: expanded as features land.
-        vec!["actions".to_string(), "body".to_string()]
+        // Honest subset, shaped like dunst's list: `body-markup` is only
+        // declared when the config allows markup (dunst does the same).
+        let mut caps = vec![
+            "actions".to_string(),
+            "body".to_string(),
+            "body-hyperlinks".to_string(),
+            "icon-static".to_string(),
+        ];
+        if self.markup.load(Ordering::Relaxed) {
+            caps.push("body-markup".to_string());
+        }
+        caps
     }
 
     async fn get_server_information(&self) -> (String, String, String, String) {
@@ -164,6 +203,14 @@ impl Notifications {
             env!("CARGO_PKG_VERSION").to_string(),
             "1.2".to_string(),
         )
+    }
+}
+
+/// Extract a string hint (`s`), if present.
+fn hint_string(hints: &HashMap<String, Value<'_>>, key: &str) -> Option<String> {
+    match hints.get(key)? {
+        Value::Str(s) => Some(s.to_string()),
+        _ => None,
     }
 }
 
@@ -303,7 +350,7 @@ impl Cmd0 {
                 );
                 m.insert("timeout".to_string(), Value::from(h.expire_timeout as i64));
                 m.insert("timestamp".to_string(), Value::from(h.timestamp as i64));
-                m.insert("progress".to_string(), Value::from(0i32));
+                m.insert("progress".to_string(), Value::from(h.value.unwrap_or(-1) as i32));
                 m
             })
             .collect()
@@ -314,6 +361,7 @@ pub fn serve(
     tx: async_channel::Sender<DbusEvent>,
     counters: Arc<DaemonCounters>,
     history: Arc<HistoryStore>,
+    markup: Arc<AtomicBool>,
 ) {
     let conn = match Connection::session() {
         Ok(c) => c,
@@ -325,7 +373,7 @@ pub fn serve(
 
     if let Err(e) = conn
         .object_server()
-        .at(DBUS_PATH, Notifications::new(tx.clone()))
+        .at(DBUS_PATH, Notifications::new(tx.clone(), markup))
     {
         log::error!("cannot register object at {DBUS_PATH}: {e}");
         std::process::exit(1);
