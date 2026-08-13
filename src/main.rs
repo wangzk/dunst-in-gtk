@@ -13,6 +13,7 @@ mod config;
 mod daemon;
 mod dbus;
 mod layout;
+mod queue;
 mod window;
 mod x11;
 
@@ -57,11 +58,12 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
-    daemon::init(conn, std::sync::Arc::new(config));
+    let counters = std::sync::Arc::new(daemon::DaemonCounters::default());
+    daemon::init(conn, std::sync::Arc::new(config), std::sync::Arc::clone(&counters));
 
     // D-Bus -> GTK event channel.
     let (tx, rx) = async_channel::unbounded::<dbus::DbusEvent>();
-    std::thread::spawn(move || dbus::serve(tx));
+    std::thread::spawn(move || dbus::serve(tx, counters));
 
     let ctx = glib::MainContext::default();
     ctx.spawn_local(async move {

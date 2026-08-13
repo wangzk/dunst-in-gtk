@@ -152,6 +152,9 @@ pub fn emit_action_invoked(
 
 pub struct NotificationWindow {
     window: gtk::Window,
+    summary_label: gtk::Label,
+    body_label: gtk::Label,
+    font_attrs: pango::AttrList,
     id: u32,
     /// The client this notification belongs to (for the closed signal).
     client: Option<String>,
@@ -160,6 +163,9 @@ pub struct NotificationWindow {
     on_event: EventCb,
     /// Whether the window has been realized/hinted/presented yet.
     presented: Cell<bool>,
+    /// Whether the pointer is currently inside the window (shared with the
+    /// motion-controller callbacks).
+    hovered: Rc<Cell<bool>>,
     /// The currently open context menu, kept alive while shown.
     popover: RefCell<Option<gtk::Popover>>,
 }
@@ -219,13 +225,18 @@ impl NotificationWindow {
 
         window.set_child(Some(&box_));
 
+        let hovered = Rc::new(Cell::new(false));
         let nw = Self {
             window,
+            summary_label,
+            body_label,
+            font_attrs,
             id,
             client,
             actions,
             on_event,
             presented: Cell::new(false),
+            hovered: Rc::clone(&hovered),
             popover: RefCell::new(None),
         };
 
@@ -239,13 +250,18 @@ impl NotificationWindow {
             glib::Propagation::Proceed
         });
 
-        // Pointer enter/leave -> hover pause/resume.
+        // Pointer enter/leave -> hover pause/resume. `hovered` lives in an
+        // Rc so the daemon can query it (replaces_id keeps the timer paused
+        // while the pointer is inside).
+        let hovered_enter = Rc::clone(&hovered);
+        let hovered_leave = Rc::clone(&hovered);
         let motion = gtk::EventControllerMotion::new();
         {
             let on_event = Rc::clone(&nw.on_event);
             let id = nw.id;
             motion.connect_enter(move |_, _, _| {
                 (on_event.borrow())(WindowEvent::Hover(id, true));
+                hovered_enter.set(true);
             });
         }
         {
@@ -253,6 +269,7 @@ impl NotificationWindow {
             let id = nw.id;
             motion.connect_leave(move |_| {
                 (on_event.borrow())(WindowEvent::Hover(id, false));
+                hovered_leave.set(false);
             });
         }
         nw.window.add_controller(motion);
@@ -328,6 +345,32 @@ impl NotificationWindow {
     /// The caller emits `NotificationClosed` itself.
     pub fn destroy(&self) {
         self.window.destroy();
+    }
+
+    /// Update the content in place (replaces_id) and re-apply the style.
+    /// The daemon reflows afterwards (the size may change).
+    pub fn update_content(&self, summary: &str, body: &str, style: &WindowStyle) {
+        let css = gtk::CssProvider::new();
+        css.load_from_data(&style_css(style));
+        self.window
+            .style_context()
+            .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+        self.summary_label.set_attributes(Some(&self.font_attrs));
+        self.body_label.set_attributes(Some(&self.font_attrs));
+        self.summary_label
+            .set_markup(&format!("<b>{}</b>", render_text(style.markup, summary)));
+        self.summary_label.set_halign(align_of(style.alignment));
+        self.body_label
+            .set_markup(&render_text(style.markup, body));
+        self.body_label.set_halign(align_of(style.alignment));
+        self.body_label.set_wrap(style.word_wrap);
+        self.body_label.set_ellipsize(ellipsize_of(style.ellipsize));
+    }
+
+    /// Whether the pointer is currently inside the window.
+    pub fn is_hovered(&self) -> bool {
+        self.hovered.get()
     }
 
     pub fn client(&self) -> &Option<String> {

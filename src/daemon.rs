@@ -9,7 +9,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use gtk4::gdk;
@@ -18,6 +19,7 @@ use gtk4::prelude::*;
 use crate::config::{Config, Follow, Monitor, MouseAction};
 use crate::dbus::DbusEvent;
 use crate::layout::{resolve_size, stack_position, MonitorGeometry};
+use crate::queue::{NotifyAction, Pending, QueueState};
 use crate::window::{
     emit_action_invoked, emit_closed_signal, EventCb, NotificationWindow, WindowEvent,
     WindowStyle,
@@ -38,10 +40,10 @@ pub fn connection() -> Option<&'static zbus::blocking::Connection> {
     CONN.get()
 }
 
-pub fn init(conn: zbus::blocking::Connection, config: std::sync::Arc<Config>) {
+pub fn init(conn: zbus::blocking::Connection, config: Arc<Config>, counters: Arc<DaemonCounters>) {
     let _ = CONN.set(conn);
     DAEMON.with(|d| {
-        *d.borrow_mut() = Some(Daemon::new(config));
+        *d.borrow_mut() = Some(Daemon::new(config, counters));
     });
 }
 
@@ -66,6 +68,16 @@ fn with_daemon<F: FnOnce(&mut Daemon)>(f: F) {
     });
 }
 
+/// Counters shared between the D-Bus thread (cmd0 properties read them) and
+/// the GTK thread (updates them). The queue module mirrors these internally;
+/// the daemon keeps both in sync.
+#[derive(Default)]
+pub struct DaemonCounters {
+    pub displayed: AtomicU32,
+    pub waiting: AtomicU32,
+    pub pause_level: AtomicU32,
+}
+
 /// Remaining-time tracking for one notification's expiry timer. The timer is
 /// a glib source that closes the notification when it fires; hover pauses it
 /// by removing the source and keeping the deadline.
@@ -78,14 +90,19 @@ pub struct Daemon {
     /// id -> (window, urgency level)
     windows: HashMap<u32, (NotificationWindow, u8)>,
     timeouts: HashMap<u32, TimeoutState>,
+    queue: QueueState,
+    counters: Arc<DaemonCounters>,
     config: std::sync::Arc<Config>,
 }
 
 impl Daemon {
-    fn new(config: std::sync::Arc<Config>) -> Self {
+    fn new(config: std::sync::Arc<Config>, counters: Arc<DaemonCounters>) -> Self {
+        let limit = config.global.notification_limit;
         Self {
             windows: HashMap::new(),
             timeouts: HashMap::new(),
+            queue: QueueState::new(limit),
+            counters,
             config,
         }
     }
@@ -252,6 +269,7 @@ impl Daemon {
                 urgency,
             ),
             DbusEvent::Close { id, reason } => self.close(id, reason),
+            DbusEvent::SetPauseLevel(level) => self.set_pause_level(level),
         }
     }
 
@@ -267,39 +285,105 @@ impl Daemon {
         expire_timeout: i32,
         urgency: u8,
     ) {
+        let pending = Pending {
+            id,
+            app_name: app_name.to_string(),
+            app_icon: app_icon.to_string(),
+            summary: summary.to_string(),
+            body: body.to_string(),
+            actions,
+            client,
+            expire_timeout,
+            urgency,
+        };
+
+        // replaces_id: update in place (waiting or displayed) instead of
+        // creating a new notification (dunst semantics).
+        if self.queue.replace_waiting(id, pending.clone()) {
+            log::info!("replaced waiting notification {id}");
+            return;
+        }
         if self.windows.contains_key(&id) {
-            log::warn!("duplicate notification id {id}, ignoring");
+            log::info!("replaced displayed notification {id}");
+            let style = WindowStyle::from_config(&self.config, urgency);
+            if let Some((nw, slot)) = self.windows.get_mut(&id) {
+                *slot = urgency;
+                nw.update_content(summary, body, &style);
+                if nw.is_hovered() {
+                    log::debug!("replaced while hovered, keeping the timer paused");
+                    self.arm_timeout(id, self.timeout_ms(expire_timeout, urgency));
+                    self.pause_timeout(id);
+                } else {
+                    self.arm_timeout(id, self.timeout_ms(expire_timeout, urgency));
+                }
+            }
+            self.relayout();
             return;
         }
 
+        match self.queue.notify(&pending) {
+            NotifyAction::ShowNow => {
+                self.create_window_from(pending);
+            }
+            NotifyAction::Queue => {
+                log::info!("notification {id} queued (limit or do-not-disturb)");
+                self.counters.waiting.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn create_window_from(&mut self, pending: Pending) {
+        let id = pending.id;
+        let (app_name, app_icon, summary, body, actions, client, urgency, timeout_ms) = (
+            pending.app_name,
+            pending.app_icon,
+            pending.summary,
+            pending.body,
+            pending.actions,
+            pending.client,
+            pending.urgency,
+            self.timeout_ms(pending.expire_timeout, pending.urgency),
+        );
         let style = WindowStyle::from_config(&self.config, urgency);
         let on_event: EventCb = Rc::new(RefCell::new(Box::new(|event| {
             with_daemon(|d| d.handle_window_event(event));
         })));
-
         let nw = NotificationWindow::new(
             id,
-            app_name,
-            app_icon,
-            summary,
-            body,
+            &app_name,
+            &app_icon,
+            &summary,
+            &body,
             actions,
             client,
             on_event,
             &style,
         );
+        self.arm_timeout(id, timeout_ms);
+        self.windows.insert(id, (nw, urgency));
+        self.counters.displayed.fetch_add(1, Ordering::Relaxed);
+        self.relayout();
+    }
 
-        // Timeout: explicit ms wins; -1 falls back to the urgency default
-        // (seconds, 0 = never). The full state machine lands in ticket 05.
-        let timeout_ms = if expire_timeout >= 0 {
+    /// Timeout in ms: explicit value wins, -1 falls back to the urgency
+    /// default (seconds, 0 = never).
+    fn timeout_ms(&self, expire_timeout: i32, urgency: u8) -> u64 {
+        if expire_timeout >= 0 {
             expire_timeout as u64
         } else {
             self.config.urgency(urgency).timeout as u64 * 1000
-        };
-        self.arm_timeout(id, timeout_ms);
+        }
+    }
 
-        self.windows.insert(id, (nw, urgency));
-        self.relayout();
+    fn set_pause_level(&mut self, level: u32) {
+        log::info!("pause level -> {level}");
+        self.counters.pause_level.store(level, Ordering::Relaxed);
+        let promote = self.queue.set_paused(level > 0);
+        for p in promote {
+            log::info!("promoting queued notification {}", p.id);
+            self.counters.waiting.fetch_sub(1, Ordering::Relaxed);
+            self.create_window_from(p);
+        }
     }
 
     fn close(&mut self, id: u32, reason: u32) {
@@ -309,7 +393,20 @@ impl Daemon {
                 emit_closed_signal(conn, nw.client().clone(), id, reason);
             }
             nw.destroy();
+            self.counters.displayed.fetch_sub(1, Ordering::Relaxed);
+            // Promote the oldest waiting notification, if any.
+            if let Some(p) = self.queue.display_closed() {
+                log::info!("promoting queued notification {}", p.id);
+                self.counters.waiting.fetch_sub(1, Ordering::Relaxed);
+                self.create_window_from(p);
+            }
             self.relayout();
+        } else if let Some(p) = self.queue.remove_waiting(id) {
+            log::info!("closed queued notification {id} (reason {reason})");
+            self.counters.waiting.fetch_sub(1, Ordering::Relaxed);
+            if let Some(conn) = connection() {
+                emit_closed_signal(conn, p.client, id, reason);
+            }
         }
     }
 

@@ -75,7 +75,7 @@ def wait_no_window(title, timeout=5.0):
 
 # ---------------------------------------------------------------- D-Bus layer
 
-def notify(conn, app, summary, body, timeout_ms, actions=None, urgency=None):
+def notify(conn, app, summary, body, timeout_ms, actions=None, urgency=None, replaces_id=0):
     """Call Notify; returns the notification id."""
     hints = {}
     if urgency is not None:
@@ -84,7 +84,7 @@ def notify(conn, app, summary, body, timeout_ms, actions=None, urgency=None):
         NOTIF_ADDR,
         "Notify",
         "susssasa{sv}i",
-        (app, 0, "dialog-information", summary, body, actions or [], hints, timeout_ms),
+        (app, replaces_id, "dialog-information", summary, body, actions or [], hints, timeout_ms),
     )
     reply = conn.send_and_get_reply(msg, timeout=10)
     return reply.body[0]
@@ -603,6 +603,127 @@ def test_context_menu(binary, conn):
     pass_(f"context menu item click invokes its action (id={nid})")
 
 
+LIMIT_DUNSTRC = """
+[global]
+notification_limit = 1
+"""
+
+
+def props_get(prop):
+    out = subprocess.run(
+        [
+            "gdbus", "call", "--session",
+            "--dest", "org.freedesktop.Notifications",
+            "--object-path", "/org/freedesktop/Notifications",
+            "--method", "org.freedesktop.DBus.Properties.Get",
+            "org.dunstproject.cmd0", prop,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.strip()
+
+
+def props_set(prop, value):
+    subprocess.run(
+        [
+            "gdbus", "call", "--session",
+            "--dest", "org.freedesktop.Notifications",
+            "--object-path", "/org/freedesktop/Notifications",
+            "--method", "org.freedesktop.DBus.Properties.Set",
+            "org.dunstproject.cmd0", prop, value,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_replaces_id(daemon, conn):
+    log("== test: replaces_id updates in place ==")
+    nid = notify(conn, "itest", "Old", "old body", 5000)
+    geoms = wait_window_geometry("dunst-in-gtk itest", 1)
+    if len(geoms) != 1:
+        fail("replace test: initial window missing")
+
+    # Replace with the same id: no second window should appear.
+    reply_id = notify(conn, "itest", "New", "new body", 5000, replaces_id=nid)
+    if reply_id != nid:
+        fail(f"replace: Notify returned {reply_id}, expected the replaces_id {nid}")
+    time.sleep(0.8)
+    if len(xdotool_windows("dunst-in-gtk itest")) != 1:
+        fail("replace: expected exactly one window after replaces_id")
+    pass_(f"replaces_id updates in place, one window (id={nid})")
+
+
+def test_queue_limit(binary, conn):
+    log("== test: notification_limit queues and promotes ==")
+    cfg_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-limit-dunstrc")
+    with open(cfg_path, "w") as f:
+        f.write(LIMIT_DUNSTRC)
+    daemon = Daemon(binary, os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-limit.log"))
+    try:
+        daemon.start(args=["-config", cfg_path])
+        if not wait_until_name_owned(conn, timeout=5.0, pid=daemon.proc.pid):
+            fail("limit daemon did not acquire the bus name")
+
+        n1 = notify(conn, "itest", "First", "shown", 5000)
+        if not wait_window_count("dunst-in-gtk itest", 1):
+            fail("first notification not displayed")
+        n2 = notify(conn, "itest", "Second", "waiting", 5000)
+        time.sleep(0.5)
+        if xdotool_windows("dunst-in-gtk itest"):
+            # still exactly one window (the first)
+            if len(xdotool_windows("dunst-in-gtk itest")) != 1:
+                fail("second notification displayed despite the limit")
+        if "uint32 1" not in props_get("waitingLength"):
+            fail(f"expected waitingLength 1, got {props_get('waitingLength')}")
+        if "uint32 1" not in props_get("displayedLength"):
+            fail(f"expected displayedLength 1, got {props_get('displayedLength')}")
+
+        # Closing the first promotes the second.
+        close_notification(conn, n1)
+        if not wait_window_count("dunst-in-gtk itest", 1):
+            fail("promoted notification did not display")
+        if "uint32 0" not in props_get("waitingLength"):
+            fail(f"expected waitingLength 0 after promotion, got {props_get('waitingLength')}")
+        close_notification(conn, n2)
+    finally:
+        daemon.stop()
+    pass_(f"notification_limit queues excess and promotes on close ({n1=} {n2=})")
+
+
+def test_do_not_disturb(binary, conn):
+    log("== test: do-not-disturb (pause level) ==")
+    daemon = Daemon(binary, os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-dnd.log"))
+    try:
+        daemon.start()
+        if not wait_until_name_owned(conn, timeout=5.0, pid=daemon.proc.pid):
+            fail("dnd daemon did not acquire the bus name")
+
+        props_set("pauseLevel", "<uint32 1>")
+        if "true" not in props_get("paused"):
+            fail(f"expected paused=true after pauseLevel=1, got {props_get('paused')}")
+
+        nid = notify(conn, "itest", "Quiet", "not now", 5000)
+        time.sleep(0.6)
+        if xdotool_windows("dunst-in-gtk itest"):
+            fail("notification displayed while paused")
+        if "uint32 1" not in props_get("waitingLength"):
+            fail(f"expected waitingLength 1 while paused, got {props_get('waitingLength')}")
+
+        # Unpause: the waiting notification appears.
+        props_set("pauseLevel", "<uint32 0>")
+        if not wait_window_count("dunst-in-gtk itest", 1):
+            fail("waiting notification did not display after unpause")
+        if "uint32 0" not in props_get("waitingLength"):
+            fail(f"expected waitingLength 0 after unpause, got {props_get('waitingLength')}")
+        close_notification(conn, nid)
+    finally:
+        daemon.stop()
+    pass_("do-not-disturb queues notifications; unpause promotes them")
+
+
 # --------------------------------------------------------------------- driver
 
 def run_tests(binary):
@@ -624,6 +745,11 @@ def run_tests(binary):
         daemon.stop()
         test_left_click_default_action(binary, conn)
         test_context_menu(binary, conn)
+        daemon.start()
+        test_replaces_id(daemon, conn)
+        daemon.stop()
+        test_queue_limit(binary, conn)
+        test_do_not_disturb(binary, conn)
         test_name_conflict(binary, conn)
         daemon.start()
         test_sigterm(daemon)

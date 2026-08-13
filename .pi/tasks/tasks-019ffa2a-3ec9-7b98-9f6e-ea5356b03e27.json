@@ -53,13 +53,13 @@
       "id": "5",
       "subject": "实现 daemon 状态机(queue/timeout/history/DnD)",
       "description": "通知生命周期: 入队→显示→超时/手动关闭→NotificationClosed 信号; 悬停暂停计时; history 环形缓冲; Do-Not-Disturb; close_all; urgency 排序。纯逻辑可单测。",
-      "status": "pending",
+      "status": "in_progress",
       "activeForm": "实现 daemon 状态机",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066306,
-      "updatedAt": 1786609066306
+      "updatedAt": 1786617860017
     },
     {
       "id": "6",
@@ -77,13 +77,13 @@
       "id": "7",
       "subject": "实现 per-notification GtkWindow 渲染与交互",
       "description": "GTK4 窗口: type hint notification + keep above + move 定位; GtkBox 布局(图标/标题/正文), Pango markup, GtkIconTheme 图标查找, 颜色/圆角 CSS, 进度条, 悬停暂停, 左键默认动作, 中键关闭, 右键动作菜单。HiDPI 由 GTK scale factor 自动处理。",
-      "status": "in_progress",
+      "status": "completed",
       "activeForm": "实现 GtkWindow 渲染与交互",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066306,
-      "updatedAt": 1786617357722
+      "updatedAt": 1786617860016
     },
     {
       "id": "8",

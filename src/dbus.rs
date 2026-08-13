@@ -11,7 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use crate::daemon::DaemonCounters;
 
 use zbus::blocking::Connection;
 use zbus::message::Header;
@@ -44,6 +46,8 @@ pub enum DbusEvent {
     },
     /// Close a notification (e.g. via CloseNotification).
     Close { id: u32, reason: u32 },
+    /// Do-not-disturb level changed (org.dunstproject.cmd0 pauseLevel/paused).
+    SetPauseLevel(u32),
 }
 
 /// The `org.freedesktop.Notifications` interface implementation.
@@ -82,7 +86,7 @@ impl Notifications {
     async fn notify(
         &self,
         app_name: String,
-        _replaces_id: u32, // replaces_id handling lands with the state machine
+        replaces_id: u32,
         app_icon: String,
         summary: String,
         body: String,
@@ -92,7 +96,13 @@ impl Notifications {
         #[zbus(header)]
         hdr: Header<'_>,
     ) -> u32 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // dunst semantics: a positive replaces_id becomes the notification id
+        // (the daemon updates the existing notification in place).
+        let id = if replaces_id > 0 {
+            replaces_id
+        } else {
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        };
         self.live_ids.lock().unwrap().insert(id);
         let client = hdr.sender().map(|s| s.to_string());
         // Actions arrive as [key1, label1, key2, label2, ...].
@@ -152,7 +162,66 @@ impl Notifications {
 }
 
 /// Runs the D-Bus server on a dedicated thread. Blocks forever.
-pub fn serve(tx: async_channel::Sender<DbusEvent>) {
+/// The `org.dunstproject.cmd0` interface, which `dunstctl` talks to.
+/// Ticket 05 provides the state properties (paused/pauseLevel and the length
+/// counters); ticket 06 adds the control methods (history, close-all, ...).
+pub struct Cmd0 {
+    tx: async_channel::Sender<DbusEvent>,
+    counters: Arc<DaemonCounters>,
+}
+
+impl Cmd0 {
+    pub fn new(tx: async_channel::Sender<DbusEvent>, counters: Arc<DaemonCounters>) -> Self {
+        Self { tx, counters }
+    }
+
+    fn request_pause_level(&self, level: u32) {
+        self.tx
+            .try_send(DbusEvent::SetPauseLevel(level))
+            .expect("GTK main loop channel closed");
+    }
+}
+
+#[zbus::interface(name = "org.dunstproject.cmd0")]
+impl Cmd0 {
+    #[zbus(property, name = "displayedLength")]
+    fn displayed_length(&self) -> u32 {
+        self.counters.displayed.load(Ordering::Relaxed)
+    }
+
+    #[zbus(property, name = "waitingLength")]
+    fn waiting_length(&self) -> u32 {
+        self.counters.waiting.load(Ordering::Relaxed)
+    }
+
+    #[zbus(property, name = "historyLength")]
+    fn history_length(&self) -> u32 {
+        // Real history lands in ticket 06.
+        0
+    }
+
+    #[zbus(property, name = "paused")]
+    fn paused(&self) -> bool {
+        self.counters.pause_level.load(Ordering::Relaxed) > 0
+    }
+
+    #[zbus(property, name = "paused")]
+    fn set_paused(&self, paused: bool) {
+        self.request_pause_level(if paused { 1 } else { 0 });
+    }
+
+    #[zbus(property, name = "pauseLevel")]
+    fn pause_level(&self) -> u32 {
+        self.counters.pause_level.load(Ordering::Relaxed)
+    }
+
+    #[zbus(property, name = "pauseLevel")]
+    fn set_pause_level(&self, level: u32) {
+        self.request_pause_level(level);
+    }
+}
+
+pub fn serve(tx: async_channel::Sender<DbusEvent>, counters: Arc<DaemonCounters>) {
     let conn = match Connection::session() {
         Ok(c) => c,
         Err(e) => {
@@ -161,8 +230,18 @@ pub fn serve(tx: async_channel::Sender<DbusEvent>) {
         }
     };
 
-    if let Err(e) = conn.object_server().at(DBUS_PATH, Notifications::new(tx)) {
+    if let Err(e) = conn
+        .object_server()
+        .at(DBUS_PATH, Notifications::new(tx.clone()))
+    {
         log::error!("cannot register object at {DBUS_PATH}: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = conn
+        .object_server()
+        .at(DBUS_PATH, Cmd0::new(tx, counters))
+    {
+        log::error!("cannot register cmd0 interface at {DBUS_PATH}: {e}");
         std::process::exit(1);
     }
 
