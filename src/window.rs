@@ -515,7 +515,7 @@ impl NotificationWindow {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        let mut summary_attrs = self.font_attrs.clone();
+        let summary_attrs = self.font_attrs.clone();
         summary_attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
         self.summary_label.set_attributes(Some(&summary_attrs));
         self.body_label.set_attributes(Some(&self.font_attrs));
