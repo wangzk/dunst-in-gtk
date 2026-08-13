@@ -8,7 +8,7 @@
 
 - [x] `cargo run` 在无显示环境下给出清晰错误；在有 X 的环境下注册成功
 - [x] 第二个 daemon 实例启动时检测到 bus name 已被占用，安静退出（退出码 0）
-- [ ] `notify-send "标题" "正文"` 弹出一个无装饰 GTK 窗口，显示标题与正文
+- [x] `notify-send "标题" "正文"` 弹出一个无装饰 GTK 窗口，显示标题与正文
 - [x] `gdbus` 调用 `CloseNotification(id)` 后窗口消失，且调用方收到 `NotificationClosed(id, reason)` 信号
 - [x] `GetCapabilities` / `GetServerInformation` 返回合法值
 - [x] 集成测试脚本（Python/jeepney + xdotool，`tests/integration.py`）（dbus-run-session + Xvfb）可一键运行，断言窗口出现/消失与信号内容
