@@ -1,20 +1,20 @@
 # dunst-in-gtk
 
-一个与 [dunst](https://dunst-project.org/) 兼容的桌面通知守护进程，用 GTK4 渲染通知窗口，用 Rust 实现。
+一个与 [dunst](https://dunst-project.org/) 兼容的桌面通知守护进程，用 GTK3 渲染通知窗口，用 Rust 实现。
 
 - **协议兼容**：`org.freedesktop.Notifications`（Notify / CloseNotification / GetCapabilities / GetServerInformation）+ dunst 扩展接口 `org.dunstproject.cmd0`（dunstctl 直接可用）
 - **配置兼容**：读取 dunst 的 `dunstrc`（新格式 `width/height/origin/offset` 与旧格式 `geometry` 都支持）
-- **渲染**：GTK4 无装饰窗口、X11 EWMH 提示（`_NET_WM_WINDOW_TYPE_NOTIFICATION` 等）、角落堆叠布局、图标（主题/文件/SVG）、Pango markup、进度条、动作菜单
+- **渲染**：GTK3 无装饰窗口、官方 EWMH 提示（`type_hint`/`keep_above`/`accept_focus` 等）、角落堆叠布局、图标（主题/文件）、Pango markup、进度条、动作菜单
 
 ## 构建
 
-需要 Rust（≥1.75）与 GTK4 开发库（≥4.8，推荐 4.14+）。
+需要 Rust（≥1.75）与 GTK3 开发库（≥3.24，Ubuntu/Debian 长期维护）。
 
 ```bash
 # Debian/Ubuntu
-sudo apt install libgtk-4-dev librsvg2-dev
+sudo apt install libgtk-3-dev
 # Fedora
-sudo dnf install gtk4-devel librsvg2-devel
+sudo dnf install gtk3-devel
 
 cargo build --release
 # 产物: target/release/dunst-in-gtk
@@ -95,7 +95,8 @@ notify-send --hint string:image-path:/path/to/pic.png "图片"  # 文件图标
 
 ## 已知限制
 
-- 仅 X11（Wayland 下 GTK4 窗口定位与 EWMH 提示不受支持；可通过 XWayland 运行）
+- 仅 X11（Wayland 下 GTK3 窗口定位与 EWMH 提示不受支持；可通过 XWayland 运行）
+- GTK3 已停止上游开发（Ubuntu 长期维护）；选择 GTK3 是因为其保留全部窗口 hint 官方 API（GTK4 已移除，导致通知在 i3 下会抢键盘焦点，且定位/置顶只能 xcb 直连）
 - Xvfb 无 RandR 1.5，无法构造双屏；`monitor` 编号/名称/越界回退/`follow = mouse` 的选择路径已在单屏下集成验证，真机多屏请以配置为准
 - `icon-data` / `icon_data` hint（内嵌图像数据）未实现；`image-path` / `image_path` 已支持
 
