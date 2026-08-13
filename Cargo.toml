@@ -1,0 +1,15 @@
+[package]
+name = "dunst-in-gtk"
+version = "0.1.0"
+edition = "2021"
+description = "A dunst-compatible notification daemon rendering notifications with GTK4 windows"
+
+[dependencies]
+gtk4 = "0.11"
+glib = "0.22"
+zbus = "5"
+async-channel = "2"
+xcb = "1"
+signal-hook = "0.3"
+log = "0.4"
+env_logger = "0.11"

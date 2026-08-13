@@ -1,0 +1,113 @@
+{
+  "nextId": 10,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "核实 dunstctl cmd0 协议与配置键语义",
+      "description": "从 dunst 源码核实: (1) org.dunstproject.cmd0 接口的方法名/签名(dunstctl 调用的), (2) dunst 配置键的精确语义(geometry, corner_radius, gap_size, offset, font, icons, markup, timeouts 等 L0+L1 涉及的键)。事实查询,不需要用户决策。",
+      "status": "completed",
+      "activeForm": "核实 dunstctl 协议与配置键语义",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1786609066303,
+      "updatedAt": 1786609388603
+    },
+    {
+      "id": "2",
+      "subject": "初始化 cargo 项目与依赖",
+      "description": "cargo new dunst-in-gtk(目录已存在则 init), Cargo.toml 配置 gtk4, zbus 5, serde/serde_json, glib, log/env_logger 等依赖, 确认能编译通过。模块骨架: config / dbus / daemon / layout / window / main。",
+      "status": "in_progress",
+      "activeForm": "初始化 cargo 项目与依赖",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1786609066305,
+      "updatedAt": 1786609388604
+    },
+    {
+      "id": "3",
+      "subject": "实现 dunst 兼容 INI 配置解析",
+      "description": "手写 INI 解析器(支持 ;/# 注释、引号、大小写不敏感键), 解析 global + urgency_low/normal/critical 段, 实现 L0+L1 相关键: font, geometry, gap_size, offset, corner_radius, background/foreground/frame 颜色, timeout/urgency, icons, markup, word_wrap, alignment, progress_bar, history_length, pause 等。带单元测试。",
+      "status": "pending",
+      "activeForm": "实现 dunst 兼容 INI 配置解析",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1786609066305,
+      "updatedAt": 1786609066305
+    },
+    {
+      "id": "4",
+      "subject": "实现 zbus D-Bus 层(Notifications + cmd0)",
+      "description": "org.freedesktop.Notifications 服务: Notify/CloseNotification/GetCapabilities/GetServerInformation + NotificationClosed/ActionInvoked 信号; org.dunstproject.cmd0 兼容接口(dunstctl 直接可用): pause/history/close/close-all/context/notify 等, 签名按 dunst 源码核实结果实现。",
+      "status": "pending",
+      "activeForm": "实现 zbus D-Bus 层",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1786609066305,
+      "updatedAt": 1786609066305
+    },
+    {
+      "id": "5",
+      "subject": "实现 daemon 状态机(queue/timeout/history/DnD)",
+      "description": "通知生命周期: 入队→显示→超时/手动关闭→NotificationClosed 信号; 悬停暂停计时; history 环形缓冲; Do-Not-Disturb; close_all; urgency 排序。纯逻辑可单测。",
+      "status": "pending",
+      "activeForm": "实现 daemon 状态机",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1786609066306,
+      "updatedAt": 1786609066306
+    },
+    {
+      "id": "6",
+      "subject": "实现 layout 角落堆叠与显示器选择",
+      "description": "dunst 几何语义: WxH+X+Y 与 gravity(右上角等), gap_size, offset, monitor 选择(当前鼠标/焦点/编号), 多显示器每显示器独立堆叠。纯数学可单测。",
+      "status": "pending",
+      "activeForm": "实现 layout 角落堆叠",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1786609066306,
+      "updatedAt": 1786609066306
+    },
+    {
+      "id": "7",
+      "subject": "实现 per-notification GtkWindow 渲染与交互",
+      "description": "GTK4 窗口: type hint notification + keep above + move 定位; GtkBox 布局(图标/标题/正文), Pango markup, GtkIconTheme 图标查找, 颜色/圆角 CSS, 进度条, 悬停暂停, 左键默认动作, 中键关闭, 右键动作菜单。HiDPI 由 GTK scale factor 自动处理。",
+      "status": "pending",
+      "activeForm": "实现 GtkWindow 渲染与交互",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1786609066306,
+      "updatedAt": 1786609066306
+    },
+    {
+      "id": "8",
+      "subject": "集成测试(Xvfb + dbus-run-session)与 i3 冒烟",
+      "description": "dbus-run-session + Xvfb 下起 daemon, notify-send 发通知, 断言窗口出现/关闭信号/位置; GDK_SCALE=2 对比截图验证 HiDPI; 单元测试全绿; 提供 i3 真机冒烟步骤。",
+      "status": "pending",
+      "activeForm": "集成测试与冒烟",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1786609066307,
+      "updatedAt": 1786609066307
+    },
+    {
+      "id": "9",
+      "subject": "打包: dunstrc 示例 + systemd unit + i3 autostart",
+      "description": "dunstrc.example(带注释的默认配置), dunst-in-gtk.service(systemd user), dunst-in-gtk.desktop(autostart), README 使用说明(含与 dunst 共存/切换方法)。",
+      "status": "pending",
+      "activeForm": "打包部署文件",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1786609066307,
+      "updatedAt": 1786609066307
+    }
+  ]
+}
