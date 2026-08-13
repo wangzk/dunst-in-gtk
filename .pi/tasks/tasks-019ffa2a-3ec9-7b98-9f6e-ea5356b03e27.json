@@ -39,15 +39,15 @@
     },
     {
       "id": "4",
-      "subject": "实现 zbus D-Bus 层(Notifications + cmd0)",
-      "description": "org.freedesktop.Notifications 服务: Notify/CloseNotification/GetCapabilities/GetServerInformation + NotificationClosed/ActionInvoked 信号; org.dunstproject.cmd0 兼容接口(dunstctl 直接可用): pause/history/close/close-all/context/notify 等, 签名按 dunst 源码核实结果实现。",
-      "status": "pending",
+      "subject": "实现 zbus D-Bus 层（Notifications 完成；cmd0 随 ticket 06）",
+      "description": "org.freedesktop.Notifications 服务已实现（Notify/CloseNotification/GetCapabilities/GetServerInformation + NotificationClosed/ActionInvoked 信号，ticket 01/04）；org.dunstproject.cmd0 兼容接口（dunstctl 直接用）随 ticket 06 完成。",
+      "status": "in_progress",
       "activeForm": "实现 zbus D-Bus 层",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066305,
-      "updatedAt": 1786609066305
+      "updatedAt": 1786617372113
     },
     {
       "id": "5",
@@ -63,51 +63,51 @@
     },
     {
       "id": "6",
-      "subject": "实现 layout 角落堆叠与显示器选择（ticket 03，暂停中：集成测试 1 个竞态待修）",
+      "subject": "实现 layout 角落堆叠与显示器选择（ticket 03）",
       "description": "dunst 几何语义: WxH+X+Y 与 gravity(右上角等), gap_size, offset, monitor 选择(当前鼠标/焦点/编号), 多显示器每显示器独立堆叠。纯数学可单测。",
-      "status": "in_progress",
+      "status": "completed",
       "activeForm": "实现 layout 角落堆叠",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066306,
-      "updatedAt": 1786611485656
+      "updatedAt": 1786617372114
     },
     {
       "id": "7",
       "subject": "实现 per-notification GtkWindow 渲染与交互",
       "description": "GTK4 窗口: type hint notification + keep above + move 定位; GtkBox 布局(图标/标题/正文), Pango markup, GtkIconTheme 图标查找, 颜色/圆角 CSS, 进度条, 悬停暂停, 左键默认动作, 中键关闭, 右键动作菜单。HiDPI 由 GTK scale factor 自动处理。",
-      "status": "pending",
+      "status": "in_progress",
       "activeForm": "实现 GtkWindow 渲染与交互",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066306,
-      "updatedAt": 1786609066306
+      "updatedAt": 1786617357722
     },
     {
       "id": "8",
-      "subject": "集成测试(Xvfb + dbus-run-session)与 i3 冒烟",
-      "description": "dbus-run-session + Xvfb 下起 daemon, notify-send 发通知, 断言窗口出现/关闭信号/位置; GDK_SCALE=2 对比截图验证 HiDPI; 单元测试全绿; 提供 i3 真机冒烟步骤。",
-      "status": "pending",
+      "subject": "集成测试（ticket 01-03 已建 7 项；i3 真机冒烟待最后）",
+      "description": "集成测试（Xvfb + dbus-run-session + jeepney + xdotool）已随 ticket 01-03 持续建设（7 项全绿，连续 3 次稳定）；剩余：ticket 04-07 的断言 + 用户 i3 真机冒烟（最后做）。",
+      "status": "in_progress",
       "activeForm": "集成测试与冒烟",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066307,
-      "updatedAt": 1786609066307
+      "updatedAt": 1786617372114
     },
     {
       "id": "9",
-      "subject": "打包: dunstrc 示例 + systemd unit + i3 autostart",
-      "description": "dunstrc.example(带注释的默认配置), dunst-in-gtk.service(systemd user), dunst-in-gtk.desktop(autostart), README 使用说明(含与 dunst 共存/切换方法)。",
+      "subject": "打包：dunstrc.example + README（命令行启动，无 systemd）",
+      "description": "dunstrc.example（带注释默认配置）、README（构建/命令行启动/与 dunst 切换说明）。明确不做 systemd unit 与 autostart——daemon 由用户命令行直接启动（用户指定）。",
       "status": "pending",
       "activeForm": "打包部署文件",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066307,
-      "updatedAt": 1786609066307
+      "updatedAt": 1786617379546
     }
   ]
 }

@@ -104,22 +104,49 @@ pub fn render_text(markup: Markup, text: &str) -> String {
     }
 }
 
-/// Callback invoked when the window is closed by the user (WM close, reason 2).
-pub type ClosedCb = Rc<RefCell<Box<dyn Fn(u32) + 'static>>>;
+/// Events a window reports to the daemon. The daemon is the single decision
+/// maker: it maps clicks to configured mouse actions, pauses/resumes timers
+/// on hover, and emits every D-Bus signal.
+#[derive(Debug, Clone)]
+pub enum WindowEvent {
+    /// User/WM-initiated close (WM_DELETE_WINDOW, alt+F4).
+    Closed(u32),
+    /// Pointer entered (true) / left (false) the window.
+    Hover(u32, bool),
+    /// Mouse button pressed: 1 = left, 2 = middle, 3 = right.
+    Click(u32, u32),
+    /// A context-menu item was chosen; the action key.
+    Action(u32, String),
+}
+
+pub type EventCb = Rc<RefCell<Box<dyn Fn(WindowEvent) + 'static>>>;
 
 /// Emit `NotificationClosed(id, reason)` to the originating client (or
-/// broadcast when the client is unknown).
-pub fn emit_closed_signal(conn: &zbus::blocking::Connection, client: Option<String>, id: u32, reason: u32) {
+/// broadcast when the client is unknown). Called only by the daemon.
+pub fn emit_closed_signal(
+    conn: &zbus::blocking::Connection,
+    client: Option<String>,
+    id: u32,
+    reason: u32,
+) {
     log::info!("NotificationClosed id={id} reason={reason}");
     let dest = client.as_deref();
-    if let Err(e) = conn.emit_signal(
-        dest,
-        DBUS_PATH,
-        DBUS_IFACE,
-        "NotificationClosed",
-        &(id, reason),
-    ) {
+    if let Err(e) = conn.emit_signal(dest, DBUS_PATH, DBUS_IFACE, "NotificationClosed", &(id, reason)) {
         log::warn!("failed to emit NotificationClosed: {e}");
+    }
+}
+
+/// Emit `ActionInvoked(id, key)` to the originating client.
+pub fn emit_action_invoked(
+    conn: &zbus::blocking::Connection,
+    client: Option<String>,
+    id: u32,
+    key: &str,
+) {
+    log::info!("ActionInvoked id={id} key={key:?}");
+    let dest = client.as_deref();
+    if let Err(e) = conn.emit_signal(dest, DBUS_PATH, DBUS_IFACE, "ActionInvoked", &(id, key)) {
+        log::warn!("failed to emit ActionInvoked: {e}");
     }
 }
 
@@ -128,9 +155,13 @@ pub struct NotificationWindow {
     id: u32,
     /// The client this notification belongs to (for the closed signal).
     client: Option<String>,
-    on_closed: ClosedCb,
+    /// (key, label) pairs from the Notify actions argument.
+    actions: Vec<(String, String)>,
+    on_event: EventCb,
     /// Whether the window has been realized/hinted/presented yet.
     presented: Cell<bool>,
+    /// The currently open context menu, kept alive while shown.
+    popover: RefCell<Option<gtk::Popover>>,
 }
 
 impl NotificationWindow {
@@ -140,8 +171,9 @@ impl NotificationWindow {
         _app_icon: &str,
         summary: &str,
         body: &str,
+        actions: Vec<(String, String)>,
         client: Option<String>,
-        on_closed: ClosedCb,
+        on_event: EventCb,
         style: &WindowStyle,
     ) -> Self {
         let window = gtk::Window::new();
@@ -191,24 +223,105 @@ impl NotificationWindow {
             window,
             id,
             client,
-            on_closed,
+            actions,
+            on_event,
             presented: Cell::new(false),
+            popover: RefCell::new(None),
         };
 
-        // User/WM-initiated close (WM_DELETE_WINDOW, alt+F4): dismissed (2).
-        // Daemon-initiated closes use destroy() and never reach this handler.
+        // User/WM-initiated close (WM_DELETE_WINDOW, alt+F4). The daemon
+        // decides (signal + bookkeeping); we just report. Daemon-initiated
+        // closes use destroy() and never reach this handler.
+        let on_event = Rc::clone(&nw.on_event);
         let id = nw.id;
-        let client = nw.client.clone();
-        let on_closed = Rc::clone(&nw.on_closed);
         nw.window.connect_close_request(move |_| {
-            if let Some(conn) = crate::daemon::connection() {
-                emit_closed_signal(conn, client.clone(), id, 2);
-            }
-            (on_closed.borrow())(id);
+            (on_event.borrow())(WindowEvent::Closed(id));
             glib::Propagation::Proceed
         });
 
+        // Pointer enter/leave -> hover pause/resume.
+        let motion = gtk::EventControllerMotion::new();
+        {
+            let on_event = Rc::clone(&nw.on_event);
+            let id = nw.id;
+            motion.connect_enter(move |_, _, _| {
+                (on_event.borrow())(WindowEvent::Hover(id, true));
+            });
+        }
+        {
+            let on_event = Rc::clone(&nw.on_event);
+            let id = nw.id;
+            motion.connect_leave(move |_| {
+                (on_event.borrow())(WindowEvent::Hover(id, false));
+            });
+        }
+        nw.window.add_controller(motion);
+
+        // Clicks: 1 = left, 2 = middle, 3 = right; the daemon maps the button
+        // to the configured mouse action sequence.
+        for button in [1u32, 2, 3] {
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(button);
+            let on_event = Rc::clone(&nw.on_event);
+            let id = nw.id;
+            gesture.connect_pressed(move |_, _, _, _| {
+                (on_event.borrow())(WindowEvent::Click(id, button));
+            });
+            nw.window.add_controller(gesture);
+        }
+
         nw
+    }
+
+    /// The default action: the one with key "default", else the first one.
+    pub fn default_action(&self) -> Option<(String, String)> {
+        self.actions
+            .iter()
+            .find(|(k, _)| k == "default")
+            .cloned()
+            .or_else(|| self.actions.first().cloned())
+    }
+
+    /// Pop up the context menu with one item per action plus a close item.
+    /// Item clicks report WindowEvent::Action / WindowEvent::Closed.
+    pub fn show_context_menu(&self) {
+        let popover = gtk::Popover::new();
+        popover.set_parent(&self.window);
+
+        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        box_.set_margin_top(6);
+        box_.set_margin_bottom(6);
+        box_.set_margin_start(6);
+        box_.set_margin_end(6);
+
+        let on_event = Rc::clone(&self.on_event);
+        let id = self.id;
+        for (key, label) in &self.actions {
+            let button = gtk::Button::with_label(label);
+            if key == "default" {
+                button.add_css_class("suggested-action");
+            }
+            let on_event = Rc::clone(&on_event);
+            let key = key.clone();
+            button.connect_clicked(move |_| {
+                (on_event.borrow())(WindowEvent::Action(id, key.clone()));
+            });
+            box_.append(&button);
+        }
+        // dunst's context menu always offers closing the notification.
+        let close_button = gtk::Button::with_label("Close");
+        {
+            let on_event = Rc::clone(&on_event);
+            close_button.connect_clicked(move |_| {
+                (on_event.borrow())(WindowEvent::Closed(id));
+            });
+        }
+        box_.append(&close_button);
+
+        popover.set_child(Some(&box_));
+        popover.popup();
+        // Keep the popover alive for the duration of the menu.
+        self.popover.replace(Some(popover));
     }
 
     /// Close the window without emitting close-request (daemon-initiated).

@@ -75,13 +75,16 @@ def wait_no_window(title, timeout=5.0):
 
 # ---------------------------------------------------------------- D-Bus layer
 
-def notify(conn, app, summary, body, timeout_ms):
+def notify(conn, app, summary, body, timeout_ms, actions=None, urgency=None):
     """Call Notify; returns the notification id."""
+    hints = {}
+    if urgency is not None:
+        hints["urgency"] = ("y", urgency)
     msg = new_method_call(
         NOTIF_ADDR,
         "Notify",
         "susssasa{sv}i",
-        (app, 0, "dialog-information", summary, body, [], {}, timeout_ms),
+        (app, 0, "dialog-information", summary, body, actions or [], hints, timeout_ms),
     )
     reply = conn.send_and_get_reply(msg, timeout=10)
     return reply.body[0]
@@ -405,6 +408,201 @@ def test_sigterm(daemon):
     pass_("SIGTERM shuts the daemon down with exit code 0")
 
 
+CONTEXT_DUNSTRC = """
+[global]
+origin = top-right
+offset = (10, 10)
+width = (200, 400)
+mouse_right_click = context
+"""
+
+
+def visible_window_ids():
+    out = subprocess.run(
+        ["xdotool", "search", "--onlyvisible", "--name", ".*"],
+        capture_output=True,
+        text=True,
+    )
+    return set(out.stdout.split())
+
+
+def window_geoms_of(wid):
+    r = subprocess.run(
+        ["xdotool", "getwindowgeometry", "--shell", wid],
+        capture_output=True,
+        text=True,
+    )
+    kv = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            kv[k.strip()] = int(v)
+    return (kv.get("X", 0), kv.get("Y", 0), kv.get("WIDTH", 0), kv.get("HEIGHT", 0))
+
+
+def test_hover_pauses_timeout(daemon, conn):
+    log("== test: hover pauses the timeout ==")
+    # Consume the closed signal too; otherwise it lingers on the bus and the
+    # next signal test reads a stale one.
+    rule = MatchRule(type="signal", interface=NOTIF_IFACE, member="NotificationClosed")
+    queue = deque()
+    with conn.filter(rule, queue=queue) as matches:
+        nid = notify(conn, "itest", "Hover", "pause me", 800)
+        geoms = wait_window_geometry("dunst-in-gtk itest", 1)
+        if len(geoms) != 1:
+            fail("hover test window missing")
+        wid = xdotool_windows("dunst-in-gtk itest")[0]
+        x, y, w, h = geoms[0]
+
+        subprocess.run(["xdotool", "mousemove", "--window", wid, str(w // 2), str(h // 2)])
+        time.sleep(1.5)  # well past the 800 ms timeout, but the pointer is inside
+        if not xdotool_windows("dunst-in-gtk itest"):
+            fail("notification expired while hovered")
+
+        subprocess.run(["xdotool", "mousemove", "1", "1"])  # leave the window
+        if not wait_no_window("dunst-in-gtk itest", timeout=4.0):
+            fail("notification did not expire after the pointer left")
+        try:
+            msg = conn.recv_until_filtered(matches, timeout=3.0)
+        except TimeoutError:
+            fail("NotificationClosed not observed after the pointer left")
+        if (msg.body[0], msg.body[1]) != (nid, 1):
+            fail(f"expected closed reason 1 (expired), got {msg.body}")
+    pass_(f"hover pauses the expiry timer (id={nid})")
+
+
+def test_left_click_default_action(binary, conn):
+    # The default dunst mouse binding closes on left click; this test uses a
+    # config that binds the left button to the default action instead.
+    log("== test: left click invokes the default action ==")
+    cfg_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-leftclick-dunstrc")
+    with open(cfg_path, "w") as f:
+        f.write("[global]\nmouse_left_click = do_action\n")
+    daemon = Daemon(binary, os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-leftclick.log"))
+    try:
+        daemon.start(args=["-config", cfg_path])
+        if not wait_until_name_owned(conn, timeout=5.0, pid=daemon.proc.pid):
+            fail("left-click daemon did not acquire the bus name")
+
+        rule = MatchRule(type="signal", interface=NOTIF_IFACE, member="ActionInvoked")
+        queue = deque()
+        with conn.filter(rule, queue=queue) as matches:
+            nid = notify(
+                conn, "itest", "Actions", "click me", 5000,
+                actions=["default", "Open", "other", "Other"],
+            )
+            geoms = wait_window_geometry("dunst-in-gtk itest", 1)
+            if len(geoms) != 1:
+                fail("action notification window missing")
+            wid = xdotool_windows("dunst-in-gtk itest")[0]
+            x, y, w, h = geoms[0]
+            subprocess.run(["xdotool", "mousemove", "--window", wid, str(w // 2), str(h // 2)])
+            subprocess.run(["xdotool", "click", "1"])
+            try:
+                msg = conn.recv_until_filtered(matches, timeout=3.0)
+            except TimeoutError:
+                fail("ActionInvoked not observed after left click")
+            if msg.body != (nid, "default"):
+                fail(f"expected ActionInvoked({nid}, 'default'), got {msg.body}")
+        if not wait_no_window("dunst-in-gtk itest", timeout=3.0):
+            fail("notification did not close after the action")
+    finally:
+        daemon.stop()
+    pass_(f"left click invokes the default action (id={nid})")
+
+
+def test_middle_click_closes(daemon, conn):
+    log("== test: middle click closes ==")
+    rule = MatchRule(type="signal", interface=NOTIF_IFACE, member="NotificationClosed")
+    queue = deque()
+    with conn.filter(rule, queue=queue) as matches:
+        nid = notify(conn, "itest", "Middle", "click me", 5000)
+        geoms = wait_window_geometry("dunst-in-gtk itest", 1)
+        if len(geoms) != 1:
+            fail("middle-click test window missing")
+        wid = xdotool_windows("dunst-in-gtk itest")[0]
+        x, y, w, h = geoms[0]
+        subprocess.run(["xdotool", "mousemove", "--window", wid, str(w // 2), str(h // 2)])
+        subprocess.run(["xdotool", "click", "2"])
+        try:
+            msg = conn.recv_until_filtered(matches, timeout=3.0)
+        except TimeoutError:
+            fail("NotificationClosed not observed after middle click")
+        if (msg.body[0], msg.body[1]) != (nid, 2):
+            fail(f"expected closed reason 2 (dismissed), got {msg.body}")
+    pass_(f"middle click closes with reason 2 (id={nid})")
+
+
+def test_context_menu(binary, conn):
+    log("== test: right click opens the context menu ==")
+    cfg_path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-context-dunstrc")
+    with open(cfg_path, "w") as f:
+        f.write(CONTEXT_DUNSTRC)
+    daemon = Daemon(binary, os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-context.log"))
+    try:
+        daemon.start(args=["-config", cfg_path])
+        if not wait_until_name_owned(conn, timeout=5.0, pid=daemon.proc.pid):
+            fail("context-menu daemon did not acquire the bus name")
+
+        rule = MatchRule(type="signal", interface=NOTIF_IFACE, member="ActionInvoked")
+        queue = deque()
+        with conn.filter(rule, queue=queue) as matches:
+            nid = notify(
+                conn, "itest", "Menu", "right click", 5000,
+                actions=["default", "Open", "other", "Other"],
+            )
+            geoms = wait_window_geometry("dunst-in-gtk itest", 1)
+            if len(geoms) != 1:
+                fail("context-menu test window missing")
+            wid = xdotool_windows("dunst-in-gtk itest")[0]
+            x, y, w, h = geoms[0]
+
+            before = visible_window_ids()
+            subprocess.run(["xdotool", "mousemove", "--window", wid, str(w // 2), str(h // 2)])
+            subprocess.run(["xdotool", "click", "3"])
+
+            # The popover is a new visible X window (a 1x1 input-only sibling
+            # also appears; pick the one with real geometry).
+            popover = None
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                for w in visible_window_ids() - before:
+                    px, py, pw_, ph_ = window_geoms_of(w)
+                    if pw_ > 1 and ph_ > 1:
+                        popover = w
+                        break
+                if popover:
+                    break
+                time.sleep(0.1)
+            if popover is None:
+                fail("context menu (popover) did not appear")
+            log(f"    popover window: {popover}")
+
+            # Click the second item ("Other"). Button heights are derived from
+            # the popover height: 3 items (Open/Other/Close) in a 6 px-margin
+            # box with 2 px spacing.
+            n_items = 3
+            margin, spacing = 6, 2
+            btn_h = (ph_ - 2 * margin - spacing * (n_items - 1)) / n_items
+            target_y = py + margin + (btn_h + spacing) + btn_h / 2  # item index 1
+            click_x, click_y = px + pw_ // 2, int(target_y)
+            log(f"    clicking popover item at ({click_x}, {click_y}); popover=({px},{py},{pw_}x{ph_}) btn_h={btn_h:.0f}")
+            subprocess.run(["xdotool", "mousemove", str(click_x), str(click_y)])
+            time.sleep(0.2)
+            subprocess.run(["xdotool", "click", "1"])
+            try:
+                msg = conn.recv_until_filtered(matches, timeout=3.0)
+            except TimeoutError:
+                fail("ActionInvoked not observed after menu item click")
+            if msg.body != (nid, "other"):
+                fail(f"expected ActionInvoked({nid}, 'other'), got {msg.body}")
+        if not wait_no_window("dunst-in-gtk itest", timeout=3.0):
+            fail("notification did not close after the menu action")
+    finally:
+        daemon.stop()
+    pass_(f"context menu item click invokes its action (id={nid})")
+
+
 # --------------------------------------------------------------------- driver
 
 def run_tests(binary):
@@ -420,6 +618,12 @@ def run_tests(binary):
         daemon.stop()
         test_layout(binary, conn)
         test_hidpi(binary, conn)
+        daemon.start()
+        test_hover_pauses_timeout(daemon, conn)
+        test_middle_click_closes(daemon, conn)
+        daemon.stop()
+        test_left_click_default_action(binary, conn)
+        test_context_menu(binary, conn)
         test_name_conflict(binary, conn)
         daemon.start()
         test_sigterm(daemon)

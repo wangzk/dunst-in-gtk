@@ -10,14 +10,18 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use gtk4::gdk;
 use gtk4::prelude::*;
 
-use crate::config::{Config, Follow, Monitor};
+use crate::config::{Config, Follow, Monitor, MouseAction};
 use crate::dbus::DbusEvent;
 use crate::layout::{resolve_size, stack_position, MonitorGeometry};
-use crate::window::{emit_closed_signal, ClosedCb, NotificationWindow, WindowStyle};
+use crate::window::{
+    emit_action_invoked, emit_closed_signal, EventCb, NotificationWindow, WindowEvent,
+    WindowStyle,
+};
 
 // GTK-side daemon state. Lives in a thread-local: everything here is owned
 // and touched exclusively by the GTK main thread (windows are !Send).
@@ -47,15 +51,33 @@ pub fn handle(event: DbusEvent) {
 
 fn with_daemon<F: FnOnce(&mut Daemon)>(f: F) {
     DAEMON.with(|d| {
-        if let Some(d) = d.borrow_mut().as_mut() {
-            f(d);
+        // try_borrow: GTK signal handlers can nest (e.g. destroying a window
+        // makes its motion controller emit a final leave event while we are
+        // already inside with_daemon); nested events are dropped, which is
+        // safe because the outer call is the one mutating the state.
+        match d.try_borrow_mut() {
+            Ok(mut guard) => {
+                if let Some(d) = guard.as_mut() {
+                    f(d);
+                }
+            }
+            Err(_) => log::debug!("dropping nested daemon event"),
         }
     });
+}
+
+/// Remaining-time tracking for one notification's expiry timer. The timer is
+/// a glib source that closes the notification when it fires; hover pauses it
+/// by removing the source and keeping the deadline.
+struct TimeoutState {
+    deadline: Instant,
+    source: Option<glib::SourceId>,
 }
 
 pub struct Daemon {
     /// id -> (window, urgency level)
     windows: HashMap<u32, (NotificationWindow, u8)>,
+    timeouts: HashMap<u32, TimeoutState>,
     config: std::sync::Arc<Config>,
 }
 
@@ -63,7 +85,146 @@ impl Daemon {
     fn new(config: std::sync::Arc<Config>) -> Self {
         Self {
             windows: HashMap::new(),
+            timeouts: HashMap::new(),
             config,
+        }
+    }
+
+    // ------------------------------------------------------------- timeouts
+
+    /// Arm (or re-arm) the expiry timer for a notification; ms == 0 = never.
+    fn arm_timeout(&mut self, id: u32, ms: u64) {
+        self.cancel_timeout(id);
+        if ms == 0 {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        let source = Self::spawn_timeout_source(id, deadline);
+        self.timeouts.insert(id, TimeoutState { deadline, source: Some(source) });
+    }
+
+    fn spawn_timeout_source(id: u32, deadline: Instant) -> glib::SourceId {
+        let delay = deadline.saturating_duration_since(Instant::now());
+        glib::timeout_add_local_once(delay, move || {
+            log::info!("notification {id} expired");
+            with_daemon(|d| d.close(id, 1));
+        })
+    }
+
+    fn cancel_timeout(&mut self, id: u32) {
+        if let Some(t) = self.timeouts.remove(&id) {
+            if let Some(s) = t.source {
+                s.remove();
+            }
+        }
+    }
+
+    fn pause_timeout(&mut self, id: u32) {
+        if let Some(t) = self.timeouts.get_mut(&id) {
+            if let Some(s) = t.source.take() {
+                s.remove();
+            }
+        }
+    }
+
+    fn resume_timeout(&mut self, id: u32) {
+        let Some(remaining) = self.timeouts.get(&id).and_then(|t| {
+            if t.source.is_some() {
+                None
+            } else {
+                Some(t.deadline.saturating_duration_since(Instant::now()))
+            }
+        }) else {
+            return;
+        };
+        if remaining.is_zero() {
+            self.close(id, 1);
+            return;
+        }
+        let deadline = Instant::now() + remaining;
+        let source = Self::spawn_timeout_source(id, deadline);
+        if let Some(t) = self.timeouts.get_mut(&id) {
+            t.deadline = deadline;
+            t.source = Some(source);
+        }
+    }
+
+    // ------------------------------------------------------- window events
+
+    fn handle_window_event(&mut self, event: WindowEvent) {
+        match event {
+            WindowEvent::Closed(id) => self.on_user_closed(id),
+            WindowEvent::Hover(id, entered) => {
+                if entered {
+                    self.pause_timeout(id);
+                } else {
+                    self.resume_timeout(id);
+                }
+            }
+            WindowEvent::Click(id, button) => self.handle_click(id, button),
+            WindowEvent::Action(id, key) => self.invoke_action(id, &key),
+        }
+    }
+
+    fn handle_click(&mut self, id: u32, button: u32) {
+        let sequence: Vec<MouseAction> = match button {
+            1 => self.config.global.mouse_left_click.clone(),
+            2 => self.config.global.mouse_middle_click.clone(),
+            _ => self.config.global.mouse_right_click.clone(),
+        };
+        for action in sequence {
+            match action {
+                MouseAction::None => {}
+                MouseAction::CloseCurrent => self.close(id, 2),
+                MouseAction::CloseAll => self.close_all(),
+                MouseAction::DoAction => self.do_default_action(id),
+                MouseAction::Context => {
+                    if let Some((nw, _)) = self.windows.get(&id) {
+                        nw.show_context_menu();
+                    }
+                }
+            }
+        }
+    }
+
+    fn do_default_action(&mut self, id: u32) {
+        let Some((nw, _)) = self.windows.get(&id) else {
+            return;
+        };
+        match nw.default_action() {
+            Some((key, _)) => self.invoke_action(id, &key),
+            None => self.close(id, 2), // no actions: clicking dismisses
+        }
+    }
+
+    /// Emit ActionInvoked, then close the notification (reason 5).
+    fn invoke_action(&mut self, id: u32, key: &str) {
+        let Some((nw, _)) = self.windows.get(&id) else {
+            return;
+        };
+        let client = nw.client().clone();
+        if let Some(conn) = connection() {
+            emit_action_invoked(conn, client, id, key);
+        }
+        self.close(id, 5);
+    }
+
+    fn close_all(&mut self) {
+        let ids: Vec<u32> = self.windows.keys().copied().collect();
+        for id in ids {
+            self.close(id, 2);
+        }
+    }
+
+    /// The user/WM closed the window itself (GTK is destroying it); we only
+    /// emit the signal and drop bookkeeping.
+    fn on_user_closed(&mut self, id: u32) {
+        self.cancel_timeout(id);
+        if let Some((nw, _)) = self.windows.remove(&id) {
+            if let Some(conn) = connection() {
+                emit_closed_signal(conn, nw.client().clone(), id, 2);
+            }
+            self.relayout();
         }
     }
 
@@ -75,6 +236,7 @@ impl Daemon {
                 app_icon,
                 summary,
                 body,
+                actions,
                 client,
                 expire_timeout,
                 urgency,
@@ -84,6 +246,7 @@ impl Daemon {
                 &app_icon,
                 &summary,
                 &body,
+                actions,
                 client,
                 expire_timeout,
                 urgency,
@@ -99,6 +262,7 @@ impl Daemon {
         app_icon: &str,
         summary: &str,
         body: &str,
+        actions: Vec<(String, String)>,
         client: Option<String>,
         expire_timeout: i32,
         urgency: u8,
@@ -109,11 +273,8 @@ impl Daemon {
         }
 
         let style = WindowStyle::from_config(&self.config, urgency);
-        let on_closed: ClosedCb = Rc::new(RefCell::new(Box::new(|id| {
-            with_daemon(|d| {
-                d.windows.remove(&id);
-                d.relayout();
-            });
+        let on_event: EventCb = Rc::new(RefCell::new(Box::new(|event| {
+            with_daemon(|d| d.handle_window_event(event));
         })));
 
         let nw = NotificationWindow::new(
@@ -122,8 +283,9 @@ impl Daemon {
             app_icon,
             summary,
             body,
+            actions,
             client,
-            on_closed,
+            on_event,
             &style,
         );
 
@@ -134,22 +296,14 @@ impl Daemon {
         } else {
             self.config.urgency(urgency).timeout as u64 * 1000
         };
-        if timeout_ms > 0 {
-            let id = id;
-            glib::timeout_add_local_once(
-                std::time::Duration::from_millis(timeout_ms),
-                move || {
-                    log::info!("notification {id} expired");
-                    with_daemon(|d| d.close(id, 1));
-                },
-            );
-        }
+        self.arm_timeout(id, timeout_ms);
 
         self.windows.insert(id, (nw, urgency));
         self.relayout();
     }
 
     fn close(&mut self, id: u32, reason: u32) {
+        self.cancel_timeout(id);
         if let Some((nw, _)) = self.windows.remove(&id) {
             if let Some(conn) = connection() {
                 emit_closed_signal(conn, nw.client().clone(), id, reason);

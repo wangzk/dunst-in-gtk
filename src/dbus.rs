@@ -32,6 +32,8 @@ pub enum DbusEvent {
         app_icon: String,
         summary: String,
         body: String,
+        /// Pairs of (key, label) from the `actions` argument.
+        actions: Vec<(String, String)>,
         /// Unique bus name of the client that created the notification; the
         /// `NotificationClosed` signal is directed back to it.
         client: Option<String>,
@@ -84,7 +86,7 @@ impl Notifications {
         app_icon: String,
         summary: String,
         body: String,
-        _actions: Vec<String>, // action handling lands with mouse interaction
+        actions: Vec<String>,
         _hints: HashMap<String, Value<'_>>,
         expire_timeout: i32,
         #[zbus(header)]
@@ -93,6 +95,14 @@ impl Notifications {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.live_ids.lock().unwrap().insert(id);
         let client = hdr.sender().map(|s| s.to_string());
+        // Actions arrive as [key1, label1, key2, label2, ...].
+        let actions: Vec<(String, String)> = actions
+            .chunks(2)
+            .filter_map(|c| match c {
+                [k, l] => Some((k.clone(), l.clone())),
+                _ => None,
+            })
+            .collect();
         // The `urgency` hint (byte, 0-2) selects the style + default timeout.
         let urgency = _hints
             .get("urgency")
@@ -107,6 +117,7 @@ impl Notifications {
                 app_icon,
                 summary,
                 body,
+                actions,
                 client,
                 expire_timeout,
                 urgency,
@@ -127,7 +138,7 @@ impl Notifications {
 
     async fn get_capabilities(&self) -> Vec<String> {
         // Honest subset: expanded as features land.
-        vec!["body".to_string()]
+        vec!["actions".to_string(), "body".to_string()]
     }
 
     async fn get_server_information(&self) -> (String, String, String, String) {
