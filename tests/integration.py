@@ -137,7 +137,7 @@ def capture_notification_closed(conn, action, timeout=5.0):
         type="signal", interface=NOTIF_IFACE, member="NotificationClosed"
     )
     queue = deque()
-    with conn.filter(rule, queue=queue) as matches:
+    with signal_filter(conn, rule) as matches:
         action(conn)
         try:
             msg = conn.recv_until_filtered(matches, timeout=timeout)
@@ -353,7 +353,7 @@ def test_expiry(daemon, conn):
         type="signal", interface=NOTIF_IFACE, member="NotificationClosed"
     )
     queue = deque()
-    with conn.filter(rule, queue=queue) as matches:
+    with signal_filter(conn, rule) as matches:
         nid = action(conn)
         try:
             msg = conn.recv_until_filtered(matches, timeout=3.0)
@@ -446,7 +446,7 @@ def test_hover_pauses_timeout(daemon, conn):
     # next signal test reads a stale one.
     rule = MatchRule(type="signal", interface=NOTIF_IFACE, member="NotificationClosed")
     queue = deque()
-    with conn.filter(rule, queue=queue) as matches:
+    with signal_filter(conn, rule) as matches:
         nid = notify(conn, "itest", "Hover", "pause me", 800)
         geoms = wait_window_geometry("dunst-in-gtk itest", 1)
         if len(geoms) != 1:
@@ -486,7 +486,7 @@ def test_left_click_default_action(binary, conn):
 
         rule = MatchRule(type="signal", interface=NOTIF_IFACE, member="ActionInvoked")
         queue = deque()
-        with conn.filter(rule, queue=queue) as matches:
+        with signal_filter(conn, rule) as matches:
             nid = notify(
                 conn, "itest", "Actions", "click me", 5000,
                 actions=["default", "Open", "other", "Other"],
@@ -515,7 +515,7 @@ def test_middle_click_closes(daemon, conn):
     log("== test: middle click closes ==")
     rule = MatchRule(type="signal", interface=NOTIF_IFACE, member="NotificationClosed")
     queue = deque()
-    with conn.filter(rule, queue=queue) as matches:
+    with signal_filter(conn, rule) as matches:
         nid = notify(conn, "itest", "Middle", "click me", 5000)
         geoms = wait_window_geometry("dunst-in-gtk itest", 1)
         if len(geoms) != 1:
@@ -546,7 +546,7 @@ def test_context_menu(binary, conn):
 
         rule = MatchRule(type="signal", interface=NOTIF_IFACE, member="ActionInvoked")
         queue = deque()
-        with conn.filter(rule, queue=queue) as matches:
+        with signal_filter(conn, rule) as matches:
             nid = notify(
                 conn, "itest", "Menu", "right click", 5000,
                 actions=["default", "Open", "other", "Other"],
@@ -724,6 +724,89 @@ def test_do_not_disturb(binary, conn):
     pass_("do-not-disturb queues notifications; unpause promotes them")
 
 
+CMD0_ADDR = DBusAddress(
+    "/org/freedesktop/Notifications",
+    bus_name="org.freedesktop.Notifications",
+    interface="org.dunstproject.cmd0",
+)
+
+
+def cmd0_call(conn, method, sig="", body=()):
+    return conn.send_and_get_reply(new_method_call(CMD0_ADDR, method, sig, body), timeout=10)
+
+
+def signal_filter(conn, rule):
+    """jeepney filters are client-side only; broadcast signals need a
+    bus-side AddMatch, otherwise only directed signals arrive."""
+    try:
+        conn.bus_proxy.AddMatch(rule)
+    except Exception:
+        pass  # a duplicate match rule is harmless
+    return conn.filter(rule)
+
+
+def test_history(binary, conn):
+    log("== test: history (list/show/clear/remove) ==")
+    daemon = Daemon(binary, os.path.join(os.environ.get("TMPDIR", "/tmp"), "dig-hist.log"))
+    try:
+        daemon.start()
+        if not wait_until_name_owned(conn, timeout=5.0, pid=daemon.proc.pid):
+            fail("history daemon did not acquire the bus name")
+
+        # Two notifications, closed by timeout, both land in history.
+        n1 = notify(conn, "itest", "HistA", "aaa", 500)
+        n2 = notify(conn, "itest", "HistB", "bbb", 500)
+        if not wait_window_count("dunst-in-gtk itest", 2, timeout=5.0):
+            n = len(xdotool_windows("dunst-in-gtk itest"))
+            tree = subprocess.run(["xwininfo", "-root", "-tree"], capture_output=True, text=True).stdout
+            log(f"    DEBUG: only {n} window(s) found; tree tail:")
+            for line in tree.splitlines()[-6:]:
+                log(f"    DEBUG: {line}")
+            fail("history test windows did not appear")
+        if not wait_no_window("dunst-in-gtk itest", timeout=5.0):
+            fail("history test notifications did not expire")
+        time.sleep(0.3)
+
+        hist = cmd0_call(conn, "NotificationListHistory").body[0]
+        log(f"    history entries: {len(hist)}, historyLength={props_get('historyLength')}, n1={n1} n2={n2}")
+        if len(hist) != 2:
+            fail(f"expected 2 history entries, got {len(hist)}")
+        # jeepney decodes a{sv} values as (signature, value) tuples.
+        by_id = {entry["id"][1]: entry for entry in hist}
+        if by_id.get(n1, {}).get("summary", (None, None))[1] != "HistA" \
+                or by_id.get(n2, {}).get("summary", (None, None))[1] != "HistB":
+            fail(f"history entries mismatch: {hist}")
+
+        # Show re-displays the newest entry.
+        cmd0_call(conn, "NotificationShow")
+        if not wait_window_count("dunst-in-gtk itest", 1):
+            fail("history show did not display a window")
+        close_notification(conn, n2)  # the re-displayed one has the original id
+
+        # Remove + its signal.
+        rule = MatchRule(type="signal", interface="org.dunstproject.cmd0", member="NotificationHistoryRemoved")
+        queue = deque()
+        with signal_filter(conn, rule) as matches:
+            cmd0_call(conn, "NotificationRemoveFromHistory", "u", (n1,))
+            msg = conn.recv_until_filtered(matches, timeout=3.0)
+            if msg.body[0] != n1:
+                fail(f"NotificationHistoryRemoved({n1}) expected, got {msg.body}")
+
+        # Clear + its signal + counter.
+        rule = MatchRule(type="signal", interface="org.dunstproject.cmd0", member="NotificationHistoryCleared")
+        queue = deque()
+        with signal_filter(conn, rule) as matches:
+            cmd0_call(conn, "NotificationClearHistory")
+            msg = conn.recv_until_filtered(matches, timeout=3.0)
+            if msg.body[0] < 1:
+                fail(f"NotificationHistoryCleared count expected >=1, got {msg.body}")
+        if "uint32 0" not in props_get("historyLength"):
+            fail(f"expected historyLength 0 after clear, got {props_get('historyLength')}")
+    finally:
+        daemon.stop()
+    pass_(f"history list/show/remove/clear verified ({n1=} {n2=})")
+
+
 # --------------------------------------------------------------------- driver
 
 def run_tests(binary):
@@ -750,6 +833,7 @@ def run_tests(binary):
         daemon.stop()
         test_queue_limit(binary, conn)
         test_do_not_disturb(binary, conn)
+        test_history(binary, conn)
         test_name_conflict(binary, conn)
         daemon.start()
         test_sigterm(daemon)

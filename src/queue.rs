@@ -123,6 +123,13 @@ impl QueueState {
     }
 
     #[allow(dead_code)]
+    /// Change the display limit (config reload); excess displayed
+    /// notifications are not closed, only future arrivals are capped.
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+    }
+
+    #[allow(dead_code)] // convenience accessor; the daemon reads counters
     pub fn paused(&self) -> bool {
         self.paused
     }

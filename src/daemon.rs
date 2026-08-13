@@ -20,10 +20,44 @@ use crate::config::{Config, Follow, Monitor, MouseAction};
 use crate::dbus::DbusEvent;
 use crate::layout::{resolve_size, stack_position, MonitorGeometry};
 use crate::queue::{NotifyAction, Pending, QueueState};
-use crate::window::{
-    emit_action_invoked, emit_closed_signal, EventCb, NotificationWindow, WindowEvent,
-    WindowStyle,
-};
+use crate::window::WindowEvent;
+
+/// A closed notification kept for `dunstctl history` / `history-pop`.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub id: u32,
+    pub app_name: String,
+    pub app_icon: String,
+    pub summary: String,
+    pub body: String,
+    pub urgency: u8,
+    pub expire_timeout: i32,
+    pub timestamp: u64,
+    pub client: Option<String>,
+}
+
+/// History shared with the D-Bus thread (ListHistory reads it directly).
+pub type HistoryStore = std::sync::Mutex<Vec<HistoryEntry>>;
+
+/// Control actions from the cmd0 interface (ticket 06).
+#[derive(Debug, Clone)]
+pub enum CmdAction {
+    CloseLast,
+    CloseAll,
+    ContextMenu,
+    Action(u32),
+    Reload(Vec<String>),
+}
+
+/// History operations requested over D-Bus.
+#[derive(Debug, Clone)]
+pub enum HistoryAction {
+    Show(u32),
+    Pop(u32),
+    Clear,
+    Remove(u32),
+}
+use crate::window::{emit_action_invoked, emit_closed_signal, EventCb, NotificationWindow, WindowStyle};
 
 // GTK-side daemon state. Lives in a thread-local: everything here is owned
 // and touched exclusively by the GTK main thread (windows are !Send).
@@ -40,10 +74,15 @@ pub fn connection() -> Option<&'static zbus::blocking::Connection> {
     CONN.get()
 }
 
-pub fn init(conn: zbus::blocking::Connection, config: Arc<Config>, counters: Arc<DaemonCounters>) {
+pub fn init(
+    conn: zbus::blocking::Connection,
+    config: Arc<Config>,
+    counters: Arc<DaemonCounters>,
+    history: Arc<HistoryStore>,
+) {
     let _ = CONN.set(conn);
     DAEMON.with(|d| {
-        *d.borrow_mut() = Some(Daemon::new(config, counters));
+        *d.borrow_mut() = Some(Daemon::new(config, counters, history));
     });
 }
 
@@ -87,24 +126,167 @@ struct TimeoutState {
 }
 
 pub struct Daemon {
-    /// id -> (window, urgency level)
-    windows: HashMap<u32, (NotificationWindow, u8)>,
+    /// id -> (window, full notification data)
+    windows: HashMap<u32, (NotificationWindow, Pending)>,
     timeouts: HashMap<u32, TimeoutState>,
     queue: QueueState,
+    history: Arc<HistoryStore>,
     counters: Arc<DaemonCounters>,
     config: std::sync::Arc<Config>,
 }
 
 impl Daemon {
-    fn new(config: std::sync::Arc<Config>, counters: Arc<DaemonCounters>) -> Self {
+    fn new(
+        config: std::sync::Arc<Config>,
+        counters: Arc<DaemonCounters>,
+        history: Arc<HistoryStore>,
+    ) -> Self {
         let limit = config.global.notification_limit;
         Self {
             windows: HashMap::new(),
             timeouts: HashMap::new(),
             queue: QueueState::new(limit),
+            history,
             counters,
             config,
         }
+    }
+
+    // -------------------------------------------------------------- history
+
+    /// Remember a closed notification (deduplicated by id, capped at
+    /// `history_length`).
+    fn push_history(&self, entry: HistoryEntry) {
+        let mut hist = self.history.lock().unwrap();
+        hist.retain(|h| h.id != entry.id);
+        hist.push(entry);
+        let cap = self.config.global.history_length.max(1);
+        while hist.len() > cap {
+            hist.remove(0);
+        }
+    }
+
+    fn pop_history_entry(&self, id: u32) -> Option<HistoryEntry> {
+        let hist = self.history.lock().unwrap();
+        if id == 0 {
+            return hist.last().cloned();
+        }
+        hist.iter().rev().find(|h| h.id == id).cloned()
+    }
+
+    fn clear_history(&self) -> usize {
+        let mut hist = self.history.lock().unwrap();
+        let n = hist.len();
+        hist.clear();
+        n
+    }
+
+    fn remove_history(&self, id: u32) -> bool {
+        let mut hist = self.history.lock().unwrap();
+        let before = hist.len();
+        hist.retain(|h| h.id != id);
+        hist.len() != before
+    }
+
+    fn handle_history_action(&mut self, action: HistoryAction) {
+        match action {
+            HistoryAction::Clear => {
+                let n = self.clear_history();
+                log::info!("history cleared ({n} entries)");
+                if let Some(conn) = connection() {
+                    if let Err(e) = conn.emit_signal(
+                        None::<&str>,
+                        crate::dbus::DBUS_PATH,
+                        crate::dbus::CMD0_IFACE,
+                        "NotificationHistoryCleared",
+                        &(n as u32),
+                    ) {
+                        log::warn!("failed to emit NotificationHistoryCleared: {e}");
+                    }
+                }
+            }
+            HistoryAction::Remove(id) => {
+                if self.remove_history(id) {
+                    log::info!("removed history entry {id}");
+                    if let Some(conn) = connection() {
+                        if let Err(e) = conn.emit_signal(
+                            None::<&str>,
+                            crate::dbus::DBUS_PATH,
+                            crate::dbus::CMD0_IFACE,
+                            "NotificationHistoryRemoved",
+                            &(id,),
+                        ) {
+                            log::warn!("failed to emit NotificationHistoryRemoved: {e}");
+                        }
+                    }
+                }
+            }
+            HistoryAction::Show(id) | HistoryAction::Pop(id) => {
+                // dunst semantics: both re-display the entry (kept in history;
+                // use history-rm to drop it).
+                let Some(entry) = self.pop_history_entry(id) else {
+                    log::info!("history show/pop: id {id} not found");
+                    return;
+                };
+                log::info!("re-displaying history entry {}", entry.id);
+                let pending = Pending {
+                    id: entry.id,
+                    app_name: entry.app_name,
+                    app_icon: entry.app_icon,
+                    summary: entry.summary,
+                    body: entry.body,
+                    actions: vec![],
+                    client: entry.client,
+                    expire_timeout: entry.expire_timeout,
+                    urgency: entry.urgency,
+                };
+                match self.queue.notify(&pending) {
+                    NotifyAction::ShowNow => self.create_window_from(pending),
+                    NotifyAction::Queue => {
+                        self.counters.waiting.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_cmd_action(&mut self, action: CmdAction) {
+        match action {
+            CmdAction::CloseLast => {
+                if let Some(&id) = self.windows.keys().max() {
+                    self.close(id, 2);
+                }
+            }
+            CmdAction::CloseAll => self.close_all(),
+            CmdAction::ContextMenu => {
+                if let Some((nw, _)) = self.windows.iter().max_by_key(|(id, _)| *id).map(|(_, v)| v) {
+                    nw.show_context_menu();
+                }
+            }
+            CmdAction::Action(id) => self.do_default_action(id),
+            CmdAction::Reload(paths) => self.reload_config(paths),
+        }
+    }
+
+    /// Re-read the config (ConfigReload) and re-apply styles + queue limit.
+    fn reload_config(&mut self, paths: Vec<String>) {
+        let path = paths.first().map(|s| s.as_str());
+        let (new_cfg, warnings) = crate::config::Config::load(path);
+        for w in &warnings {
+            log::warn!("{w}");
+        }
+        self.queue.set_limit(new_cfg.global.notification_limit);
+        // Re-style every live window with the fresh config.
+        let windows: Vec<u32> = self.windows.keys().copied().collect();
+        for id in windows {
+            if let Some((nw, pending)) = self.windows.get(&id) {
+                let style = WindowStyle::from_config(&new_cfg, pending.urgency);
+                nw.update_content(&pending.summary, &pending.body, &style);
+            }
+        }
+        *std::sync::Arc::make_mut(&mut self.config) = new_cfg;
+        self.relayout();
+        log::info!("config reloaded");
     }
 
     // ------------------------------------------------------------- timeouts
@@ -237,9 +419,29 @@ impl Daemon {
     /// emit the signal and drop bookkeeping.
     fn on_user_closed(&mut self, id: u32) {
         self.cancel_timeout(id);
-        if let Some((nw, _)) = self.windows.remove(&id) {
+        if let Some((nw, pending)) = self.windows.remove(&id) {
             if let Some(conn) = connection() {
                 emit_closed_signal(conn, nw.client().clone(), id, 2);
+            }
+            self.push_history(HistoryEntry {
+                id,
+                app_name: pending.app_name,
+                app_icon: pending.app_icon,
+                summary: pending.summary,
+                body: pending.body,
+                urgency: pending.urgency,
+                expire_timeout: pending.expire_timeout,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                client: pending.client,
+            });
+            self.counters.displayed.fetch_sub(1, Ordering::Relaxed);
+            if let Some(p) = self.queue.display_closed() {
+                log::info!("promoting queued notification {}", p.id);
+                self.counters.waiting.fetch_sub(1, Ordering::Relaxed);
+                self.create_window_from(p);
             }
             self.relayout();
         }
@@ -270,6 +472,8 @@ impl Daemon {
             ),
             DbusEvent::Close { id, reason } => self.close(id, reason),
             DbusEvent::SetPauseLevel(level) => self.set_pause_level(level),
+            DbusEvent::History(action) => self.handle_history_action(action),
+            DbusEvent::Cmd(action) => self.handle_cmd_action(action),
         }
     }
 
@@ -292,7 +496,7 @@ impl Daemon {
             summary: summary.to_string(),
             body: body.to_string(),
             actions,
-            client,
+            client: client.clone(),
             expire_timeout,
             urgency,
         };
@@ -306,16 +510,23 @@ impl Daemon {
         if self.windows.contains_key(&id) {
             log::info!("replaced displayed notification {id}");
             let style = WindowStyle::from_config(&self.config, urgency);
+            let timeout_ms = self.timeout_ms(expire_timeout, urgency);
+            let mut hovered = false;
             if let Some((nw, slot)) = self.windows.get_mut(&id) {
-                *slot = urgency;
+                slot.urgency = urgency;
+                slot.summary = summary.to_string();
+                slot.body = body.to_string();
+                slot.app_name = app_name.to_string();
+                slot.app_icon = app_icon.to_string();
+                slot.expire_timeout = expire_timeout;
+                slot.client = client.clone();
                 nw.update_content(summary, body, &style);
-                if nw.is_hovered() {
-                    log::debug!("replaced while hovered, keeping the timer paused");
-                    self.arm_timeout(id, self.timeout_ms(expire_timeout, urgency));
-                    self.pause_timeout(id);
-                } else {
-                    self.arm_timeout(id, self.timeout_ms(expire_timeout, urgency));
-                }
+                hovered = nw.is_hovered();
+            }
+            self.arm_timeout(id, timeout_ms);
+            if hovered {
+                log::debug!("replaced while hovered, keeping the timer paused");
+                self.pause_timeout(id);
             }
             self.relayout();
             return;
@@ -334,17 +545,16 @@ impl Daemon {
 
     fn create_window_from(&mut self, pending: Pending) {
         let id = pending.id;
-        let (app_name, app_icon, summary, body, actions, client, urgency, timeout_ms) = (
-            pending.app_name,
-            pending.app_icon,
-            pending.summary,
-            pending.body,
-            pending.actions,
-            pending.client,
-            pending.urgency,
+        let (app_name, app_icon, summary, body, actions, client, timeout_ms) = (
+            pending.app_name.clone(),
+            pending.app_icon.clone(),
+            pending.summary.clone(),
+            pending.body.clone(),
+            pending.actions.clone(),
+            pending.client.clone(),
             self.timeout_ms(pending.expire_timeout, pending.urgency),
         );
-        let style = WindowStyle::from_config(&self.config, urgency);
+        let style = WindowStyle::from_config(&self.config, pending.urgency);
         let on_event: EventCb = Rc::new(RefCell::new(Box::new(|event| {
             with_daemon(|d| d.handle_window_event(event));
         })));
@@ -360,7 +570,7 @@ impl Daemon {
             &style,
         );
         self.arm_timeout(id, timeout_ms);
-        self.windows.insert(id, (nw, urgency));
+        self.windows.insert(id, (nw, pending));
         self.counters.displayed.fetch_add(1, Ordering::Relaxed);
         self.relayout();
     }
@@ -388,10 +598,24 @@ impl Daemon {
 
     fn close(&mut self, id: u32, reason: u32) {
         self.cancel_timeout(id);
-        if let Some((nw, _)) = self.windows.remove(&id) {
+        if let Some((nw, pending)) = self.windows.remove(&id) {
             if let Some(conn) = connection() {
                 emit_closed_signal(conn, nw.client().clone(), id, reason);
             }
+            self.push_history(HistoryEntry {
+                id,
+                app_name: pending.app_name,
+                app_icon: pending.app_icon,
+                summary: pending.summary,
+                body: pending.body,
+                urgency: pending.urgency,
+                expire_timeout: pending.expire_timeout,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                client: pending.client,
+            });
             nw.destroy();
             self.counters.displayed.fetch_sub(1, Ordering::Relaxed);
             // Promote the oldest waiting notification, if any.
@@ -427,7 +651,7 @@ impl Daemon {
         let mut ordered: Vec<(u32, u8)> = self
             .windows
             .iter()
-            .map(|(id, (_, urgency))| (*id, *urgency))
+            .map(|(id, (_, pending))| (*id, pending.urgency))
             .collect();
         if cfg.global.sort {
             ordered.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));

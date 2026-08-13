@@ -59,11 +59,17 @@ fn main() -> std::process::ExitCode {
         }
     };
     let counters = std::sync::Arc::new(daemon::DaemonCounters::default());
-    daemon::init(conn, std::sync::Arc::new(config), std::sync::Arc::clone(&counters));
+    let history = std::sync::Arc::new(daemon::HistoryStore::default());
+    daemon::init(
+        conn,
+        std::sync::Arc::new(config),
+        std::sync::Arc::clone(&counters),
+        std::sync::Arc::clone(&history),
+    );
 
     // D-Bus -> GTK event channel.
     let (tx, rx) = async_channel::unbounded::<dbus::DbusEvent>();
-    std::thread::spawn(move || dbus::serve(tx, counters));
+    std::thread::spawn(move || dbus::serve(tx, counters, history));
 
     let ctx = glib::MainContext::default();
     ctx.spawn_local(async move {

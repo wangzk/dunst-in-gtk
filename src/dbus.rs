@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::daemon::DaemonCounters;
+use crate::daemon::{CmdAction, DaemonCounters, HistoryAction, HistoryStore};
 
 use zbus::blocking::Connection;
 use zbus::message::Header;
@@ -23,6 +23,8 @@ use zbus::zvariant::Value;
 pub const DBUS_NAME: &str = "org.freedesktop.Notifications";
 pub const DBUS_PATH: &str = "/org/freedesktop/Notifications";
 pub const DBUS_IFACE: &str = "org.freedesktop.Notifications";
+/// The dunstctl control interface (same name/path as the spec interface).
+pub const CMD0_IFACE: &str = "org.dunstproject.cmd0";
 
 /// Events sent from the D-Bus thread to the GTK main thread.
 #[derive(Debug, Clone)]
@@ -48,6 +50,10 @@ pub enum DbusEvent {
     Close { id: u32, reason: u32 },
     /// Do-not-disturb level changed (org.dunstproject.cmd0 pauseLevel/paused).
     SetPauseLevel(u32),
+    /// History operation (show/pop/clear/remove).
+    History(HistoryAction),
+    /// Control operation (close-last/close-all/context/action/reload).
+    Cmd(CmdAction),
 }
 
 /// The `org.freedesktop.Notifications` interface implementation.
@@ -168,17 +174,30 @@ impl Notifications {
 pub struct Cmd0 {
     tx: async_channel::Sender<DbusEvent>,
     counters: Arc<DaemonCounters>,
+    history: Arc<HistoryStore>,
 }
 
 impl Cmd0 {
-    pub fn new(tx: async_channel::Sender<DbusEvent>, counters: Arc<DaemonCounters>) -> Self {
-        Self { tx, counters }
+    pub fn new(
+        tx: async_channel::Sender<DbusEvent>,
+        counters: Arc<DaemonCounters>,
+        history: Arc<HistoryStore>,
+    ) -> Self {
+        Self {
+            tx,
+            counters,
+            history,
+        }
     }
 
     fn request_pause_level(&self, level: u32) {
         self.tx
             .try_send(DbusEvent::SetPauseLevel(level))
             .expect("GTK main loop channel closed");
+    }
+
+    fn send(&self, event: DbusEvent) {
+        self.tx.try_send(event).expect("GTK main loop channel closed");
     }
 }
 
@@ -196,8 +215,7 @@ impl Cmd0 {
 
     #[zbus(property, name = "historyLength")]
     fn history_length(&self) -> u32 {
-        // Real history lands in ticket 06.
-        0
+        self.history.lock().unwrap().len() as u32
     }
 
     #[zbus(property, name = "paused")]
@@ -219,9 +237,84 @@ impl Cmd0 {
     fn set_pause_level(&self, level: u32) {
         self.request_pause_level(level);
     }
+
+    // ----------------------------------------------------------- methods
+
+    fn ping(&self) {}
+
+    fn notification_action(&self, id: u32) {
+        self.send(DbusEvent::Cmd(CmdAction::Action(id)));
+    }
+
+    fn notification_close_last(&self) {
+        self.send(DbusEvent::Cmd(CmdAction::CloseLast));
+    }
+
+    fn notification_close_all(&self) {
+        self.send(DbusEvent::Cmd(CmdAction::CloseAll));
+    }
+
+    fn context_menu_call(&self) {
+        self.send(DbusEvent::Cmd(CmdAction::ContextMenu));
+    }
+
+    fn config_reload(&self, configs: Vec<String>) {
+        self.send(DbusEvent::Cmd(CmdAction::Reload(configs)));
+    }
+
+    fn notification_show(&self) {
+        self.send(DbusEvent::History(HistoryAction::Show(0)));
+    }
+
+    fn notification_pop_history(&self, id: u32) {
+        self.send(DbusEvent::History(HistoryAction::Pop(id)));
+    }
+
+    fn notification_remove_from_history(&self, id: u32) {
+        self.send(DbusEvent::History(HistoryAction::Remove(id)));
+    }
+
+    fn notification_clear_history(&self) {
+        self.send(DbusEvent::History(HistoryAction::Clear));
+    }
+
+    /// The full history as `aa{sv}` (dunst-compatible); dunstctl formats it
+    /// as JSON via `busctl --json`.
+    fn notification_list_history(&self) -> Vec<HashMap<String, Value<'static>>> {
+        let hist = self.history.lock().unwrap();
+        // Reverse chronological, like dunst.
+        hist.iter()
+            .rev()
+            .map(|h| {
+                let mut m = HashMap::new();
+                m.insert("id".to_string(), Value::from(h.id as i32));
+                m.insert("appname".to_string(), Value::from(h.app_name.clone()));
+                m.insert("summary".to_string(), Value::from(h.summary.clone()));
+                m.insert("body".to_string(), Value::from(h.body.clone()));
+                m.insert("icon_path".to_string(), Value::from(h.app_icon.clone()));
+                m.insert("category".to_string(), Value::from(String::new()));
+                m.insert(
+                    "urgency".to_string(),
+                    Value::from(match h.urgency {
+                        0 => "low",
+                        2 => "critical",
+                        _ => "normal",
+                    }),
+                );
+                m.insert("timeout".to_string(), Value::from(h.expire_timeout as i64));
+                m.insert("timestamp".to_string(), Value::from(h.timestamp as i64));
+                m.insert("progress".to_string(), Value::from(0i32));
+                m
+            })
+            .collect()
+    }
 }
 
-pub fn serve(tx: async_channel::Sender<DbusEvent>, counters: Arc<DaemonCounters>) {
+pub fn serve(
+    tx: async_channel::Sender<DbusEvent>,
+    counters: Arc<DaemonCounters>,
+    history: Arc<HistoryStore>,
+) {
     let conn = match Connection::session() {
         Ok(c) => c,
         Err(e) => {
@@ -239,7 +332,7 @@ pub fn serve(tx: async_channel::Sender<DbusEvent>, counters: Arc<DaemonCounters>
     }
     if let Err(e) = conn
         .object_server()
-        .at(DBUS_PATH, Cmd0::new(tx, counters))
+        .at(DBUS_PATH, Cmd0::new(tx, counters, history))
     {
         log::error!("cannot register cmd0 interface at {DBUS_PATH}: {e}");
         std::process::exit(1);
