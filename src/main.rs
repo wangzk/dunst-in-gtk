@@ -16,9 +16,8 @@ mod icons;
 mod layout;
 mod queue;
 mod window;
-mod x11;
 
-use gtk4 as gtk;
+use gtk as gtk;
 
 fn main() -> std::process::ExitCode {
     env_logger::init();

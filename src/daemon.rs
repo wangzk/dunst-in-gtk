@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use gtk4::gdk;
-use gtk4::prelude::*;
+use gtk::gdk;
+use gtk::prelude::*;
 
 use crate::config::{Config, Follow, Markup, Monitor, MouseAction};
 use crate::dbus::DbusEvent;
@@ -721,9 +721,8 @@ impl Daemon {
 /// Resolve the monitor to place notifications on, per `follow`/`monitor`.
 fn resolve_monitor(cfg: &Config) -> Option<MonitorGeometry> {
     let display = gdk::Display::default()?;
-    let model = display.monitors();
-    let monitors: Vec<gdk::Monitor> = (0..model.n_items())
-        .filter_map(|i| model.item(i).and_then(|o| o.downcast::<gdk::Monitor>().ok()))
+    let monitors: Vec<gdk::Monitor> = (0..display.n_monitors())
+        .map(|i| display.monitor(i).expect("monitor index"))
         .collect();
     if monitors.is_empty() {
         return None;
@@ -731,12 +730,13 @@ fn resolve_monitor(cfg: &Config) -> Option<MonitorGeometry> {
 
     let picked: Option<gdk::Monitor> = match cfg.global.follow {
         Follow::Mouse => {
-            let surface = display
+            // GTK3: pointer window via the default seat's pointer device.
+            let window = display
                 .default_seat()
                 .and_then(|seat| seat.pointer())
-                .and_then(|dev| dev.surface_at_position().0);
-            match surface {
-                Some(s) => display.monitor_at_surface(&s).or_else(|| monitors.first().cloned()),
+                .and_then(|dev| dev.window_at_position().0);
+            match window {
+                Some(w) => display.monitor_at_window(&w).or_else(|| monitors.first().cloned()),
                 None => monitors.first().cloned(),
             }
         }
@@ -748,7 +748,7 @@ fn resolve_monitor(cfg: &Config) -> Option<MonitorGeometry> {
             }
             Monitor::Name(name) => monitors
                 .iter()
-                .find(|m| m.connector().map(|c| c.contains(name.as_str())).unwrap_or(false))
+                .find(|m| m.model().map(|c| c.contains(name.as_str())).unwrap_or(false))
                 .cloned()
                 .or_else(|| monitors.first().cloned()),
         },

@@ -1,15 +1,21 @@
-//! A single notification window (GTK4).
+//! A single notification window (GTK3).
 //!
-//! Each notification gets its own `GtkWindow` (dunst's architecture): type
-//! hint NOTIFICATION + keep-above, undecorated, positioned programmatically.
-//! HiDPI handling is delegated entirely to GTK's per-window scale factor.
+//! Each notification gets its own `GtkWindow` (dunst's architecture). GTK3
+//! still ships the classic toplevel hints as first-class APIs, so everything
+//! the X11 layer used to do by hand in the GTK4 version is now official:
+//!   - `set_type_hint(WindowTypeHint::Notification)`
+//!   - `set_accept_focus(false)` + `set_focus_on_map(false)` — never steal
+//!     the keyboard focus (maps to WM_HINTS input=False)
+//!   - `set_keep_above(true)` / `set_skip_taskbar_hint(true)` /
+//!     `set_skip_pager_hint(true)`
+//!   - `move_(x, y)` for corner placement
+//! HiDPI is handled by GTK's per-window scale factor (logical coordinates).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gtk4 as gtk;
-use gtk4::pango;
-use gtk4::prelude::*;
+use gtk::pango;
+use gtk::prelude::*;
 
 use crate::config::{
     Alignment, Color, Config, Ellipsize, IconPosition, Markup, VerticalAlignment,
@@ -46,7 +52,6 @@ pub struct WindowStyle {
     pub progress_bar_height: i32,
     pub progress_bar_frame_width: i32,
     pub progress_bar_min_width: i32,
-    pub progress_bar_max_width: i32,
 }
 
 impl WindowStyle {
@@ -79,7 +84,6 @@ impl WindowStyle {
             progress_bar_height: cfg.global.progress_bar_height,
             progress_bar_frame_width: cfg.global.progress_bar_frame_width,
             progress_bar_min_width: cfg.global.progress_bar_min_width,
-            progress_bar_max_width: cfg.global.progress_bar_max_width,
         }
     }
 }
@@ -109,10 +113,8 @@ pub fn style_css(style: &WindowStyle) -> String {
         if style.progress_bar_min_width > 0 {
             rules.push_str(&format!("min-width: {}px;", style.progress_bar_min_width));
         }
-        // Note: GTK4 CSS has no max-width property (theme parser rejects
-        // it), so progress_bar_max_width is parsed for dunst compat but not
-        // emitted; the bar's natural width is capped by the notification
-        // width anyway (halign=Start).
+        // Neither GTK3 nor GTK4 CSS has max-width; the config keeps the key
+        // for dunst compat but it is not emitted here.
         progress = format!(
             r#"
 window.notification progressbar.progress {{
@@ -221,11 +223,10 @@ pub struct NotificationContent {
     pub value: Option<i32>,
 }
 
-/// Remove every child of a container widget (GTK4 has no `children()`;
-/// walk `first_child` and unparent instead).
-fn clear_children(container: &gtk::Widget) {
-    while let Some(child) = container.first_child() {
-        child.unparent();
+/// Remove every child of a container widget (GTK3 has `get_children`).
+fn clear_children(container: &gtk::Container) {
+    for child in container.children() {
+        container.remove(&child);
     }
 }
 
@@ -246,13 +247,19 @@ pub struct NotificationWindow {
     /// (key, label) pairs from the Notify actions argument.
     actions: Vec<(String, String)>,
     on_event: EventCb,
-    /// Whether the window has been realized/hinted/presented yet.
+    /// Whether the window has been shown yet.
     presented: Cell<bool>,
     /// Whether the pointer is currently inside the window (shared with the
-    /// motion-controller callbacks).
+    /// enter/leave callbacks).
     hovered: Rc<Cell<bool>>,
     /// The currently open context menu, kept alive while shown.
-    popover: RefCell<Option<gtk::Popover>>,
+    popover: RefCell<Option<gtk::Menu>>,
+    /// The content widget (window child): anchor for the context menu.
+    /// GTK3 resolves the popover's toplevel via
+    /// `gtk_widget_get_ancestor(relative_to, GTK_TYPE_WINDOW)`, which
+    /// returns NULL for a toplevel itself — the anchor must be a widget
+    /// *inside* the window.
+    content: gtk::Widget,
 }
 
 impl NotificationWindow {
@@ -265,22 +272,33 @@ impl NotificationWindow {
         on_event: EventCb,
         style: &WindowStyle,
     ) -> Self {
-        let window = gtk::Window::new();
-        // The id makes the title unique so the X11 layer can target this
-        // exact window for positioning (siblings share the app name).
-        window.set_title(Some(&format!("dunst-in-gtk {app_name} [{id}]")));
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        // The title keeps the per-notification identity (integration tests
+        // locate windows by it).
+        window.set_title(&format!("dunst-in-gtk {app_name} [{id}]"));
         window.set_decorated(false);
         window.set_resizable(false);
-        window.add_css_class("notification");
+        // Official GTK3 toplevel hints (GTK4 removed all of these):
+        // notification type, never take keyboard focus, stay on top,
+        // skip taskbar/pager.
+        window.set_type_hint(gtk::gdk::WindowTypeHint::Notification);
+        window.set_accept_focus(false);
+        window.set_focus_on_map(false);
+        window.set_keep_above(true);
+        window.set_skip_taskbar_hint(true);
+        window.set_skip_pager_hint(true);
+        // Needed so the CSS background (with alpha) paints over the default
+        // window background.
+        window.set_app_paintable(true);
+        window.style_context().add_class("notification");
 
         let css = gtk::CssProvider::new();
-        css.load_from_data(&style_css(style));
-        window
-            .style_context()
-            .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        css.load_from_data(style_css(style).as_bytes()).expect("style CSS");
+        window.style_context().add_provider(
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
 
-        // GTK4's GtkLabel has no font_desc property (removed); use a Pango
-        // font-desc attribute instead.
         let font_desc = pango::FontDescription::from_string(&style.font);
         let font_attrs = pango::AttrList::new();
         font_attrs.insert(pango::AttrFontDesc::new(&font_desc));
@@ -302,10 +320,10 @@ impl NotificationWindow {
 
         // Text column: summary, body, then the progress-bar slot.
         let text_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        text_box.append(&summary_label);
-        text_box.append(&body_label);
+        text_box.pack_start(&summary_label, false, false, 0);
+        text_box.pack_start(&body_label, false, false, 0);
         let progress_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        text_box.append(&progress_slot);
+        text_box.pack_start(&progress_slot, false, false, 0);
 
         // Icon slot next to (or above) the text, per `icon_position`.
         let icon_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -316,23 +334,24 @@ impl NotificationWindow {
             };
             let content_box = gtk::Box::new(orientation, style.text_icon_padding.max(0));
             if style.icon_position == IconPosition::Right {
-                content_box.append(&text_box);
-                content_box.append(&icon_slot);
+                content_box.pack_start(&text_box, false, false, 0);
+                content_box.pack_start(&icon_slot, false, false, 0);
             } else {
-                content_box.append(&icon_slot);
-                content_box.append(&text_box);
+                content_box.pack_start(&icon_slot, false, false, 0);
+                content_box.pack_start(&text_box, false, false, 0);
             }
-            content_box.add_css_class("notification");
+            content_box.style_context().add_class("notification");
             content_box.upcast()
         } else {
-            text_box.add_css_class("notification");
+            text_box.style_context().add_class("notification");
             text_box.upcast()
         };
         child.set_margin_top(style.padding);
         child.set_margin_bottom(style.padding);
         child.set_margin_start(style.h_padding);
         child.set_margin_end(style.h_padding);
-        window.set_child(Some(&child));
+        window.add(&child);
+        let content_widget: gtk::Widget = child.clone().upcast();
 
         let hovered = Rc::new(Cell::new(false));
         let nw = Self {
@@ -350,15 +369,16 @@ impl NotificationWindow {
             presented: Cell::new(false),
             hovered: Rc::clone(&hovered),
             popover: RefCell::new(None),
+            content: content_widget,
         };
         nw.set_icon_and_progress(content, style);
 
         // User/WM-initiated close (WM_DELETE_WINDOW, alt+F4). The daemon
-        // decides (signal + bookkeeping); we just report. Daemon-initiated
-        // closes use destroy() and never reach this handler.
+        // decides (signal + bookkeeping); we just report. Inhibit(false)
+        // lets GTK destroy the window, matching the daemon's bookkeeping.
         let on_event = Rc::clone(&nw.on_event);
         let id = nw.id;
-        nw.window.connect_close_request(move |_| {
+        nw.window.connect_delete_event(move |_, _| {
             (on_event.borrow())(WindowEvent::Closed(id));
             glib::Propagation::Proceed
         });
@@ -368,36 +388,34 @@ impl NotificationWindow {
         // while the pointer is inside).
         let hovered_enter = Rc::clone(&hovered);
         let hovered_leave = Rc::clone(&hovered);
-        let motion = gtk::EventControllerMotion::new();
         {
             let on_event = Rc::clone(&nw.on_event);
             let id = nw.id;
-            motion.connect_enter(move |_, _, _| {
+            nw.window.connect_enter_notify_event(move |_, _| {
                 (on_event.borrow())(WindowEvent::Hover(id, true));
                 hovered_enter.set(true);
+                glib::Propagation::Proceed
             });
         }
         {
             let on_event = Rc::clone(&nw.on_event);
             let id = nw.id;
-            motion.connect_leave(move |_| {
+            nw.window.connect_leave_notify_event(move |_, _| {
                 (on_event.borrow())(WindowEvent::Hover(id, false));
                 hovered_leave.set(false);
+                glib::Propagation::Proceed
             });
         }
-        nw.window.add_controller(motion);
 
-        // Clicks: 1 = left, 2 = middle, 3 = right; the daemon maps the button
-        // to the configured mouse action sequence.
-        for button in [1u32, 2, 3] {
-            let gesture = gtk::GestureClick::new();
-            gesture.set_button(button);
+        // Clicks: the daemon maps the button (1/2/3) to the configured
+        // mouse action sequence.
+        {
             let on_event = Rc::clone(&nw.on_event);
             let id = nw.id;
-            gesture.connect_pressed(move |_, _, _, _| {
-                (on_event.borrow())(WindowEvent::Click(id, button));
+            nw.window.connect_button_press_event(move |_, ev| {
+                (on_event.borrow())(WindowEvent::Click(id, ev.button()));
+                glib::Propagation::Proceed
             });
-            nw.window.add_controller(gesture);
         }
 
         nw
@@ -414,59 +432,63 @@ impl NotificationWindow {
 
     /// Pop up the context menu with one item per action plus a close item.
     /// Item clicks report WindowEvent::Action / WindowEvent::Closed.
+    ///
+    /// GTK3's GtkMenu is used (not GtkPopover): the menu is a real toplevel
+    /// X window, so it works without a compositor and is visible to the
+    /// integration tests.
     pub fn show_context_menu(&self) {
-        let popover = gtk::Popover::new();
-        popover.set_parent(&self.window);
-
-        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        box_.set_margin_top(6);
-        box_.set_margin_bottom(6);
-        box_.set_margin_start(6);
-        box_.set_margin_end(6);
-
+        let menu = gtk::Menu::new();
         let on_event = Rc::clone(&self.on_event);
         let id = self.id;
         for (key, label) in &self.actions {
-            let button = gtk::Button::with_label(label);
+            let item = gtk::MenuItem::with_label(label);
             if key == "default" {
-                button.add_css_class("suggested-action");
+                item.style_context().add_class("suggested-action");
             }
             let on_event = Rc::clone(&on_event);
             let key = key.clone();
-            button.connect_clicked(move |_| {
+            let key_log = key.clone();
+            item.connect_activate(move |_| {
+                log::debug!("menu item activated: {key_log}");
                 (on_event.borrow())(WindowEvent::Action(id, key.clone()));
             });
-            box_.append(&button);
+            menu.append(&item);
         }
         // dunst's context menu always offers closing the notification.
-        let close_button = gtk::Button::with_label("Close");
+        let close_item = gtk::MenuItem::with_label("Close");
         {
             let on_event = Rc::clone(&on_event);
-            close_button.connect_clicked(move |_| {
+            close_item.connect_activate(move |_| {
                 (on_event.borrow())(WindowEvent::Closed(id));
             });
         }
-        box_.append(&close_button);
+        menu.append(&close_item);
 
-        popover.set_child(Some(&box_));
-        popover.popup();
-        // Keep the popover alive for the duration of the menu.
-        self.popover.replace(Some(popover));
+        menu.show_all();
+        menu.popup_at_widget(
+            &self.content,
+            gtk::gdk::Gravity::SouthWest,
+            gtk::gdk::Gravity::NorthWest,
+            None,
+        );
+        // Keep the menu alive for the duration of the popup.
+        self.popover.replace(Some(menu));
     }
 
     /// Close the window without emitting close-request (daemon-initiated).
     /// The caller emits `NotificationClosed` itself.
     pub fn destroy(&self) {
-        self.window.destroy();
+        unsafe { self.window.destroy() };
     }
 
     /// Update the content in place (replaces_id) and re-apply the style.
     pub fn update_content(&self, content: &NotificationContent, style: &WindowStyle) {
         let css = gtk::CssProvider::new();
-        css.load_from_data(&style_css(style));
-        self.window
-            .style_context()
-            .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        css.load_from_data(style_css(style).as_bytes()).expect("style CSS");
+        self.window.style_context().add_provider(
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
 
         self.summary_label.set_attributes(Some(&self.font_attrs));
         self.body_label.set_attributes(Some(&self.font_attrs));
@@ -486,25 +508,27 @@ impl NotificationWindow {
     /// Rebuild the icon and progress-bar widgets for the current content
     /// (both live in slots so replaces_id updates can swap them).
     fn set_icon_and_progress(&self, content: &NotificationContent, style: &WindowStyle) {
-        clear_children(self.icon_slot.upcast_ref::<gtk::Widget>());
+        clear_children(self.icon_slot.upcast_ref::<gtk::Container>());
         if let Some(icon) = crate::icons::icon_widget(
             &content.app_icon,
             &self.app_name,
             style,
-            &WidgetExt::display(&self.window),
+            WidgetExt::scale_factor(&self.window),
         ) {
-            self.icon_slot.append(&icon);
+            self.icon_slot.pack_start(&icon, false, false, 0);
+            icon.show();
         }
 
-        clear_children(self.progress_slot.upcast_ref::<gtk::Widget>());
+        clear_children(self.progress_slot.upcast_ref::<gtk::Container>());
         let Some(value) = content.value.filter(|_| style.progress_bar) else {
             return;
         };
         let bar = gtk::ProgressBar::new();
         bar.set_fraction((value.clamp(0, 100) as f64) / 100.0);
         bar.set_halign(gtk::Align::Start);
-        bar.add_css_class("progress");
-        self.progress_slot.append(&bar);
+        bar.style_context().add_class("progress");
+        self.progress_slot.pack_start(&bar, false, false, 0);
+        bar.show();
     }
 
     /// Whether the pointer is currently inside the window.
@@ -524,45 +548,26 @@ impl NotificationWindow {
     /// Natural (unconstrained) content size in logical pixels.
     pub fn natural_size(&self) -> (i32, i32) {
         let content = self.window.child().expect("window has a child");
-        let (_, nw, _, _) = content.measure(gtk::Orientation::Horizontal, -1);
-        let (_, nh, _, _) = content.measure(gtk::Orientation::Vertical, -1);
-        (nw.max(1), nh.max(1))
+        let (_, natural) = content.preferred_size();
+        (natural.width.max(1), natural.height.max(1))
     }
 
     /// Natural height when wrapped to the given width (logical pixels).
     pub fn height_for_width(&self, width: i32) -> i32 {
         let content = self.window.child().expect("window has a child");
-        let (_, nh, _, _) = content.measure(gtk::Orientation::Vertical, width.max(1));
+        let (_, nh) = content.preferred_height_for_width(width.max(1));
         nh.max(1)
     }
 
-    /// Apply the final geometry. The first call realizes the window, applies
-    /// the X11 EWMH hints and presents; later calls (reflows) only reposition
-    /// via the X11 configure request. All values are logical pixels; the X11
-    /// layer converts by the surface scale factor.
+    /// Apply the final geometry (logical pixels; GTK handles HiDPI scaling).
+    /// The first call shows the window; later calls (reflows) reposition
+    /// and resize via the official GTK3 window APIs.
     pub fn apply_geometry(&self, x: i32, y: i32, width: i32, height: i32) {
         self.window.set_default_size(width.max(1), height.max(1));
+        self.window.move_(x, y);
         if !self.presented.get() {
-            <gtk::Widget as gtk::prelude::WidgetExt>::realize(
-                self.window.upcast_ref::<gtk::Widget>(),
-            );
-            crate::x11::apply_window_hints_and_position(
-                &self.window,
-                x,
-                y,
-                width.max(1) as u32,
-                height.max(1) as u32,
-            );
-            self.window.present();
+            self.window.show_all();
             self.presented.set(true);
-        } else {
-            crate::x11::apply_window_hints_and_position(
-                &self.window,
-                x,
-                y,
-                width.max(1) as u32,
-                height.max(1) as u32,
-            );
         }
     }
 }
@@ -612,7 +617,6 @@ mod tests {
             progress_bar_height: 10,
             progress_bar_frame_width: 1,
             progress_bar_min_width: 150,
-            progress_bar_max_width: 300,
         }
     }
 

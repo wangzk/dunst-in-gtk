@@ -88,7 +88,7 @@
     {
       "id": "8",
       "subject": "集成测试（ticket 01-03 已建 7 项；i3 真机冒烟待最后）",
-      "description": "集成测试（Xvfb + dbus-run-session + jeepney + xdotool）已随 ticket 01-03 持续建设（7 项全绿，连续 3 次稳定）；剩余：ticket 04-07 的断言 + 用户 i3 真机冒烟（最后做）。",
+      "description": "集成测试已随 ticket 01-08 全量建设并全绿（33 单测 + 17 项集成，含像素断言）。唯一剩余：用户 i3 真机冒烟（Xvfb 无法覆盖：真实桌面/多屏/Wayland 需用户验证）。",
       "status": "in_progress",
       "activeForm": "集成测试与冒烟",
       "metadata": {},
@@ -100,8 +100,8 @@
     {
       "id": "9",
       "subject": "打包：dunstrc.example + README（命令行启动，无 systemd）",
-      "description": "dunstrc.example（带注释默认配置）、README（构建/命令行启动/与 dunst 切换说明）。明确不做 systemd unit 与 autostart——daemon 由用户命令行直接启动（用户指定）。",
-      "status": "pending",
+      "description": "已完成：dunstrc.example（全部键注释+默认值）+ README（构建/启动/切换/dunstctl 兼容表/已知限制），冒烟通过（-config dunstrc.example + notify-send）。提交 8c8309c。",
+      "status": "completed",
       "activeForm": "打包部署文件",
       "metadata": {},
       "blocks": [],
