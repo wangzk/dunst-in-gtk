@@ -41,25 +41,25 @@
       "id": "4",
       "subject": "实现 zbus D-Bus 层（Notifications 完成；cmd0 随 ticket 06）",
       "description": "org.freedesktop.Notifications 服务已实现（Notify/CloseNotification/GetCapabilities/GetServerInformation + NotificationClosed/ActionInvoked 信号，ticket 01/04）；org.dunstproject.cmd0 兼容接口（dunstctl 直接用）随 ticket 06 完成。",
-      "status": "in_progress",
+      "status": "completed",
       "activeForm": "实现 zbus D-Bus 层",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066305,
-      "updatedAt": 1786617372113
+      "updatedAt": 1786618838582
     },
     {
       "id": "5",
       "subject": "实现 daemon 状态机(queue/timeout/history/DnD)",
       "description": "通知生命周期: 入队→显示→超时/手动关闭→NotificationClosed 信号; 悬停暂停计时; history 环形缓冲; Do-Not-Disturb; close_all; urgency 排序。纯逻辑可单测。",
-      "status": "in_progress",
+      "status": "completed",
       "activeForm": "实现 daemon 状态机",
       "metadata": {},
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066306,
-      "updatedAt": 1786617860017
+      "updatedAt": 1786618838583
     },
     {
       "id": "6",
@@ -83,7 +83,7 @@
       "blocks": [],
       "blockedBy": [],
       "createdAt": 1786609066306,
-      "updatedAt": 1786617860016
+      "updatedAt": 1786618838583
     },
     {
       "id": "8",

@@ -109,9 +109,10 @@ pub fn style_css(style: &WindowStyle) -> String {
         if style.progress_bar_min_width > 0 {
             rules.push_str(&format!("min-width: {}px;", style.progress_bar_min_width));
         }
-        if style.progress_bar_max_width > 0 {
-            rules.push_str(&format!("max-width: {}px;", style.progress_bar_max_width));
-        }
+        // Note: GTK4 CSS has no max-width property (theme parser rejects
+        // it), so progress_bar_max_width is parsed for dunst compat but not
+        // emitted; the bar's natural width is capped by the notification
+        // width anyway (halign=Start).
         progress = format!(
             r#"
 window.notification progressbar.progress {{
@@ -630,7 +631,7 @@ mod tests {
         let css = style_css(&style());
         assert!(css.contains("min-height: 10px;"), "{css}");
         assert!(css.contains("min-width: 150px;"), "{css}");
-        assert!(css.contains("max-width: 300px;"), "{css}");
+        assert!(!css.contains("max-width"), "{css}");
         assert!(css.contains("progressbar trough"), "{css}");
         assert!(css.contains("border-radius: 0;"), "{css}");
     }

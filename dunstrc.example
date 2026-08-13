@@ -1,0 +1,149 @@
+# dunstrc.example — 默认配置示例 for dunst-in-gtk
+#
+# 复制到 ~/.config/dunst/dunstrc 后按需修改，daemon 启动时自动加载；
+# 也可用 `-config <path>` 指定其他位置。
+#
+# 语法与 dunst 兼容：`;` 或 `#` 注释、键名大小写不敏感、字符串可用引号。
+# 未出现的键使用文档中的默认值；未知键会打警告日志但不会中断启动。
+#
+# 支持两套几何格式：
+#   新格式（dunst ≥1.9）：width / height / origin / offset
+#   旧格式（dunst <1.9）：geometry = WxH+X+Y（带符号表示方向）
+# 本文件使用新格式。
+
+[global]
+
+# ---- 布局 ----
+
+# 通知宽度/高度：(min, max) 范围或固定值；0 = 自适应内容。
+#   固定值:     width = 300
+#   范围:       width = (200, 400)
+#   百分比:     width = 30%      （占显示器宽度）
+width = (0, 400)
+height = (0, 800)
+
+# 通知出现的屏幕角落（九宫格）: top-left / top-center / top-right /
+# left / center / right / bottom-left / bottom-center / bottom-right
+origin = top-right
+
+# 距屏幕边缘的留白 (水平, 垂直)，像素
+offset = (10, 10)
+
+# 堆叠通知之间的间距，像素
+gap_size = 8
+
+# ---- 外观 ----
+
+# 圆角半径，像素
+corner_radius = 0
+
+# 边框宽度，像素
+frame_width = 3
+
+# 边框颜色（十六进制 #rrggbb 或 #rrggbbaa）
+frame_color = #aaaaaa
+
+# 字体（Pango font description）
+font = Monospace 8
+
+# 正文是否解析 Pango markup: yes / no / strip
+# 注意：markup = no 时 `body-markup` 能力不会被声明
+markup = yes
+
+# 正文超长时是否换行
+word_wrap = no
+
+# 超出时省略方式: start / middle / end
+ellipsize = middle
+
+# 文本对齐: left / center / right
+alignment = left
+
+# 垂直对齐: top / center / bottom
+vertical_alignment = top
+
+# 背景透明程度: 0 = 不透明 .. 100 = 全透明
+transparency = 0
+
+# ---- 图标 ----
+
+# 是否显示图标
+icons = yes
+
+# 图标位置: left / right / top / off
+icon_position = left
+
+# 图标最小/最大尺寸（逻辑像素，HiDPI 下自动按比例放大）
+min_icon_size = 32
+max_icon_size = 64
+
+# 内边距：窗口内容与边框的间距 (padding)，水平内边距 (horizontal_padding)，
+# 图标与文本之间的间距 (text_icon_padding)
+padding = 8
+horizontal_padding = 8
+text_icon_padding = 0
+
+# ---- 进度条（`value` hint）----
+
+progress_bar = yes
+progress_bar_height = 10
+progress_bar_frame_width = 1      # <0 时继承 frame_width
+progress_bar_min_width = 150
+progress_bar_max_width = 300
+
+# ---- 历史与队列 ----
+
+# 关闭的通知保留在 history 中的条数（dunstctl history 可见）
+history_length = 20
+
+# 同时显示的通知上限；0 = 不限制（超出进 waiting 队列）
+notification_limit = 0
+
+# 显示器选择: 0 = 主显示器；或显示器名称（如 HDMI-1）
+monitor = 0
+
+# 跟随模式: none / mouse / keyboard（决定用哪个显示器；与 monitor 互斥）
+follow = none
+
+# ---- 鼠标交互 ----
+
+# 左/中/右键动作序列，可组合: close_current / close_all / do_action /
+# context / none
+mouse_left_click = close_current
+mouse_middle_click = do_action, close_current
+mouse_right_click = close_all
+
+# ---- 其他（已解析但暂未实现，保留以兼容真实配置）----
+
+# stack_duplicates = no
+# hide_duplicate_count = no
+# ignore_newline = no
+
+# ---- 旧格式几何（二选一，优先使用上方新格式键）----
+# geometry = "300x100+10+10"   # WxH+X+Y，正负号表示角落方向
+
+
+# ================= urgency 段 =================
+# 每个段可覆盖: timeout / background / foreground / frame_color / highlight
+# 段名大小写不敏感（urgency_LOW 等价 urgency_low）。
+
+[urgency_low]
+timeout = 10
+background = #cccccc
+foreground = #000000
+frame_color = #aaaaaa
+highlight = #2ecc71
+
+[urgency_normal]
+timeout = 10
+background = #cccccc
+foreground = #000000
+frame_color = #aaaaaa
+highlight = #2ecc71
+
+[urgency_critical]
+timeout = 0          # 0 = 永不超时
+background = #ff5555
+foreground = #ffffff
+frame_color = #ff0000
+highlight = #2ecc71

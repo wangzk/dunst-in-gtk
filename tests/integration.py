@@ -75,16 +75,21 @@ def wait_no_window(title, timeout=5.0):
 
 # ---------------------------------------------------------------- D-Bus layer
 
-def notify(conn, app, summary, body, timeout_ms, actions=None, urgency=None, replaces_id=0):
-    """Call Notify; returns the notification id."""
-    hints = {}
+def notify(conn, app, summary, body, timeout_ms, actions=None, urgency=None, replaces_id=0,
+           icon=None, hints=None):
+    """Call Notify; returns the notification id.
+
+    `icon` overrides the default app_icon; `hints` merges extra
+    (sig, value) pairs on top of the urgency hint.
+    """
+    hints = dict(hints or {})
     if urgency is not None:
         hints["urgency"] = ("y", urgency)
     msg = new_method_call(
         NOTIF_ADDR,
         "Notify",
         "susssasa{sv}i",
-        (app, replaces_id, "dialog-information", summary, body, actions or [], hints, timeout_ms),
+        (app, replaces_id, icon if icon is not None else "dialog-information", summary, body, actions or [], hints, timeout_ms),
     )
     reply = conn.send_and_get_reply(msg, timeout=10)
     return reply.body[0]
@@ -266,6 +271,316 @@ def test_hidpi(binary, conn):
         daemon.stop()
     pass_("GDK_SCALE=2 doubles the physical size and offsets")
 
+
+# ------------------------------------------------------- ticket 07 (icons/markup/progress)
+
+T07_DUNSTRC = """
+[global]
+origin = top-left
+offset = (10, 10)
+width = (0, 400)
+height = (0, 800)
+icons = yes
+icon_position = left
+min_icon_size = 48
+max_icon_size = 48
+progress_bar = yes
+progress_bar_height = 10
+progress_bar_min_width = 150
+markup = yes
+"""
+
+T07_MARKUP_OFF_DUNSTRC = T07_DUNSTRC + "markup = no\n"
+
+
+def shot(path):
+    """Grab the root window to `path`."""
+    subprocess.run(["import", "-window", "root", path], check=True)
+
+
+def window_pixels(path, xmax=500, ymax=400):
+    """Return (w, h, px) of the root screenshot plus a 2D pixel array.
+
+    px[y][x] is a (r, g, b) tuple; scans are limited to the top-left
+    corner where the top-left-origin test window lives."""
+    from PIL import Image
+
+    im = Image.open(path).convert("RGB")
+    w, h = im.size
+    return w, h, im.load()
+
+
+def bbox_of(px, xmax, ymax, step=2):
+    """Bounding box of non-background pixels (background = pure black/white)."""
+    minx, miny, maxx, maxy = xmax, ymax, -1, -1
+    for y in range(0, ymax, step):
+        for x in range(0, xmax, step):
+            r, g, b = px[x, y]
+            if not (r > 250 and g > 250 and b > 250) and not (r < 6 and g < 6 and b < 6):
+                minx, miny = min(minx, x), min(miny, y)
+                maxx, maxy = max(maxx, x), max(maxy, y)
+    return (minx, miny, maxx, maxy)
+
+
+def count_orange(px, xmax, ymax):
+    """Firefox-brand orange pixels (r>200, 90<g<190, b<100)."""
+    n = 0
+    for y in range(0, ymax):
+        for x in range(0, xmax):
+            r, g, b = px[x, y]
+            if r > 200 and 90 < g < 190 and b < 100:
+                n += 1
+    return n
+
+
+def diff_pixels(path_a, path_b, xmax=500, ymax=400, step=1):
+    """Count pixels that differ between two screenshots (scaled: step 1)."""
+    from PIL import Image
+
+    a = Image.open(path_a).convert("RGB").load()
+    b = Image.open(path_b).convert("RGB").load()
+    n = 0
+    for y in range(0, ymax, step):
+        for x in range(0, xmax, step):
+            if a[x, y] != b[x, y]:
+                n += 1
+    return n
+
+
+def test_icons_markup_progress(binary, conn):
+    log("== test: icons, markup, progress bar (ticket 07) ==")
+    tmp = os.environ.get("TMPDIR", "/tmp")
+    cfg_path = os.path.join(tmp, "dig-t07-dunstrc")
+    cfg_off_path = os.path.join(tmp, "dig-t07-markup-off-dunstrc")
+    with open(cfg_path, "w") as f:
+        f.write(T07_DUNSTRC)
+    with open(cfg_off_path, "w") as f:
+        f.write(T07_MARKUP_OFF_DUNSTRC)
+
+    daemon = Daemon(binary, os.path.join(tmp, "dig-t07.log"))
+    try:
+        daemon.start(args=["-config", cfg_path])
+        if not wait_until_name_owned(conn, timeout=5.0):
+            fail("t07 daemon did not acquire the bus name")
+
+        # --- 1. themed icon renders (firefox exists in hicolor) ---
+        nid = notify(conn, "t07", "icon", "body", 5000, icon="firefox")
+        if not wait_for_window("dunst-in-gtk t07"):
+            fail("icon notification window missing")
+        time.sleep(0.4)
+        shot(os.path.join(tmp, "t07-icon.png"))
+        _, _, px = window_pixels(os.path.join(tmp, "t07-icon.png"))
+        if count_orange(px, 200, 120) < 40:
+            fail("firefox theme icon did not render (no orange pixels)")
+        close_notification(conn, nid)
+        wait_no_window("dunst-in-gtk t07")
+
+        # --- 2. missing icon name -> placeholder letter (taller window) ---
+        nid = notify(conn, "t07", "noicon", "body", 5000, icon="")
+        wait_for_window("dunst-in-gtk t07")
+        time.sleep(0.4)
+        shot(os.path.join(tmp, "t07-noicon.png"))
+        _, _, px = window_pixels(os.path.join(tmp, "t07-noicon.png"))
+        noicon_bb = bbox_of(px, 200, 120)
+        if count_orange(px, 200, 120) != 0:
+            fail("no-icon notification must not show a themed icon")
+        close_notification(conn, nid)
+        wait_no_window("dunst-in-gtk t07")
+
+        nid = notify(conn, "t07", "missing", "body", 5000, icon="dialog-information")
+        wait_for_window("dunst-in-gtk t07")
+        time.sleep(0.4)
+        shot(os.path.join(tmp, "t07-missing.png"))
+        _, _, px = window_pixels(os.path.join(tmp, "t07-missing.png"))
+        miss_bb = bbox_of(px, 200, 120)
+        close_notification(conn, nid)
+        wait_no_window("dunst-in-gtk t07")
+        # The placeholder letter sits in the 48px icon column, so the window
+        # must be noticeably taller than the no-icon window.
+        if miss_bb[3] - miss_bb[1] <= noicon_bb[3] - noicon_bb[1] + 12:
+            fail(
+                f"missing icon should render a placeholder letter "
+                f"(window taller than no-icon: {miss_bb} vs {noicon_bb})"
+            )
+
+        # --- 3. progress bar from the `value` hint; replaces_id updates it ---
+        nid = notify(conn, "t07", "progress", "body", 5000, icon="", hints={"value": ("i", 10)})
+        wait_for_window("dunst-in-gtk t07")
+        time.sleep(0.4)
+        shot(os.path.join(tmp, "t07-prog10.png"))
+        _, _, px = window_pixels(os.path.join(tmp, "t07-prog10.png"))
+        prog_bb = bbox_of(px, 220, 140)
+        # Progress bar adds height beyond the plain text window.
+        if prog_bb[3] - prog_bb[1] <= noicon_bb[3] - noicon_bb[1] + 8:
+            fail(f"value hint should add a progress bar (window {prog_bb} vs plain {noicon_bb})")
+
+        # replaces_id: same id, value 10 -> 90; no new window, bar changes.
+        nid2 = notify(conn, "t07", "progress", "body", 5000, icon="",
+                      replaces_id=nid, hints={"value": ("i", 90)})
+        if nid2 != nid:
+            fail(f"replaces_id should keep the id, got {nid} -> {nid2}")
+        if len(xdotool_windows("dunst-in-gtk t07")) != 1:
+            fail("replaces_id update opened a new window")
+        time.sleep(0.4)
+        shot(os.path.join(tmp, "t07-prog90.png"))
+        # The filled bar length changes 10% -> 90%: real pixel difference.
+        d = diff_pixels(os.path.join(tmp, "t07-prog10.png"), os.path.join(tmp, "t07-prog90.png"),
+                        xmax=220, ymax=140)
+        if d < 80:
+            fail(f"progress bar did not visually update on replaces_id (diff={d} px)")
+        close_notification(conn, nid)
+        wait_no_window("dunst-in-gtk t07")
+    finally:
+        daemon.stop()
+
+    # --- 4. markup=no renders the literal text (wider window) ---
+    body_markup = "<b>BOLD</b>"
+    try:
+        daemon = Daemon(binary, os.path.join(tmp, "dig-t07-off.log"))
+        daemon.start(args=["-config", cfg_off_path])
+        if not wait_until_name_owned(conn, timeout=5.0):
+            fail("t07 markup-off daemon did not acquire the bus name")
+        nid = notify(conn, "t07", "markup", body_markup, 5000, icon="")
+        wait_for_window("dunst-in-gtk t07")
+        time.sleep(0.4)
+        w_off = window_geoms("dunst-in-gtk t07")[0][2]
+        close_notification(conn, nid)
+        wait_no_window("dunst-in-gtk t07")
+    finally:
+        daemon.stop()
+
+    try:
+        daemon = Daemon(binary, os.path.join(tmp, "dig-t07-on.log"))
+        daemon.start(args=["-config", cfg_path])
+        if not wait_until_name_owned(conn, timeout=5.0):
+            fail("t07 markup daemon did not acquire the bus name")
+        nid = notify(conn, "t07", "markup", body_markup, 5000, icon="")
+        wait_for_window("dunst-in-gtk t07")
+        time.sleep(0.4)
+        w_on = window_geoms("dunst-in-gtk t07")[0][2]
+        close_notification(conn, nid)
+        wait_no_window("dunst-in-gtk t07")
+        if w_off <= w_on:
+            fail(f"markup=no should render literal <b> tags (wider), got {w_off} vs {w_on}")
+    finally:
+        daemon.stop()
+    pass_(
+        f"icons (themed+placeholder), markup yes/no ({w_on}px vs {w_off}px), "
+        "progress bar + replaces_id update verified"
+    )
+
+
+def icon_band_heights(path, xmax=300, ymax=200):
+    """Y-extent of the firefox-orange pixels in a screenshot (the logo's
+    orange band inside the icon square).
+
+    The firefox logo does not fill its square: at 48 logical px the orange
+    band is ~29 px tall, at 96 physical px it is ~55-58 px. The HiDPI test
+    therefore compares scale-2 against scale-1 band heights (≈2x) rather
+    than asserting an absolute pixel size.
+    """
+    _, _, px = window_pixels(path, xmax, ymax)
+    ys = [y for y in range(ymax) for x in range(xmax)
+          if px[x, y][0] > 200 and 90 < px[x, y][1] < 190 and px[x, y][2] < 100]
+    if not ys:
+        return 0
+    return max(ys) - min(ys) + 1
+
+
+def test_icons_hidpi(binary, conn):
+    """GDK_SCALE=2: the 48px-logical icon renders at 2x the physical size
+    (orange band ~29px @ scale 1 -> ~58px @ scale 2)."""
+    log("== test: icon HiDPI scaling (GDK_SCALE=2) ==")
+    tmp = os.environ.get("TMPDIR", "/tmp")
+    cfg_path = os.path.join(tmp, "dig-t07-dunstrc")
+    heights = {}
+    for scale in ("1", "2"):
+        daemon = Daemon(binary, os.path.join(tmp, f"dig-t07-hidpi{scale}.log"))
+        try:
+            daemon.start(args=["-config", cfg_path], env={"GDK_SCALE": scale})
+            if not wait_until_name_owned(conn, timeout=5.0):
+                fail(f"t07 hidpi daemon (scale {scale}) did not acquire the bus name")
+            nid = notify(conn, "t07", "icon", "body", 5000, icon="firefox")
+            wait_for_window("dunst-in-gtk t07")
+            time.sleep(0.4)
+            path = os.path.join(tmp, f"t07-icon{scale}x.png")
+            shot(path)
+            close_notification(conn, nid)
+            wait_no_window("dunst-in-gtk t07")
+            heights[scale] = icon_band_heights(path)
+        finally:
+            daemon.stop()
+    h1, h2 = heights.get("1", 0), heights.get("2", 0)
+    if h1 < 15:
+        fail(f"no firefox icon pixels at scale 1 (band={h1})")
+    if not (h2 >= 1.6 * h1 and h2 >= h1 + 15):
+        fail(f"icon should render ~2x physical size at scale 2, got {h1} -> {h2}")
+    pass_(f"icon renders at 2x physical size under GDK_SCALE=2 ({h1}px -> {h2}px)")
+
+
+def test_monitor_selection(binary, conn):
+    """resolve_monitor paths on a single screen (ticket 03 remainder):
+    monitor number, out-of-range fallback, monitor name, follow=mouse.
+
+    Xvfb exposes RandR < 1.5, so a real dual-monitor layout cannot be
+    created here (xrandr --setmonitor is a no-op); every selection path is
+    exercised and must land on the single screen and place the window at
+    the configured top-left origin.
+    """
+    log("== test: monitor selection paths (single screen) ==")
+    tmp = os.environ.get("TMPDIR", "/tmp")
+    base = """
+[global]
+origin = top-left
+offset = (10, 10)
+width = (200, 400)
+monitor = {monitor}
+"""
+    cases = [
+        ("number-0", "monitor = 0"),
+        ("number-oob", "monitor = 99"),  # falls back to the only screen
+        ("follow-mouse", "follow = mouse"),
+    ]
+    for name, mon_line in cases:
+        cfg_path = os.path.join(tmp, f"dig-mon-{name}-dunstrc")
+        with open(cfg_path, "w") as f:
+            f.write(base.format(monitor=mon_line))
+        daemon = Daemon(binary, os.path.join(tmp, f"dig-mon-{name}.log"))
+        try:
+            daemon.start(args=["-config", cfg_path])
+            if not wait_until_name_owned(conn, timeout=5.0):
+                fail(f"monitor test {name}: daemon did not acquire the bus name")
+            nid = notify(conn, "mon", name, "body", 5000)
+            geoms = wait_window_geometry("dunst-in-gtk mon", 1)
+            if len(geoms) != 1:
+                fail(f"monitor test {name}: window missing")
+            x, y, w, h = geoms[0]
+            # 200-wide window at top-left with offset 10 on the only screen.
+            if (x, y) != (10, 10):
+                fail(f"monitor test {name}: expected (10, 10), got {geoms}")
+            close_notification(conn, nid)
+            wait_no_window("dunst-in-gtk mon")
+        finally:
+            daemon.stop()
+    # Monitor *name*: xrandr reports the screen as "screen" on Xvfb; the
+    # config may also name the connector. "screen" must resolve.
+    cfg_path = os.path.join(tmp, "dig-mon-name-dunstrc")
+    with open(cfg_path, "w") as f:
+        f.write(base.format(monitor="monitor = screen"))
+    daemon = Daemon(binary, os.path.join(tmp, "dig-mon-name.log"))
+    try:
+        daemon.start(args=["-config", cfg_path])
+        if not wait_until_name_owned(conn, timeout=5.0):
+            fail("monitor-name daemon did not acquire the bus name")
+        nid = notify(conn, "mon", "name", "body", 5000)
+        geoms = wait_window_geometry("dunst-in-gtk mon", 1)
+        if len(geoms) != 1 or geoms[0][:2] != (10, 10):
+            fail(f"monitor name 'screen': expected (10,10), got {geoms}")
+        close_notification(conn, nid)
+        wait_no_window("dunst-in-gtk mon")
+    finally:
+        daemon.stop()
+    pass_("monitor number / out-of-range / name / follow=mouse all resolve to the screen")
 
 
 
@@ -822,6 +1137,9 @@ def run_tests(binary):
         daemon.stop()
         test_layout(binary, conn)
         test_hidpi(binary, conn)
+        test_icons_markup_progress(binary, conn)
+        test_icons_hidpi(binary, conn)
+        test_monitor_selection(binary, conn)
         daemon.start()
         test_hover_pauses_timeout(daemon, conn)
         test_middle_click_closes(daemon, conn)
