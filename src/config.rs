@@ -191,7 +191,7 @@ impl Default for GlobalConfig {
             offset: (10, 10),
             gap_size: 0,
             corner_radius: 0,
-            frame_width: 3,
+            frame_width: 0,
             frame_color: Color::rgb(0xaa, 0xaa, 0xaa),
             font: "Monospace 8".to_string(),
             markup: Markup::Full,

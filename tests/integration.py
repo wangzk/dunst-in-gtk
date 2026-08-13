@@ -893,18 +893,15 @@ def test_context_menu(binary, conn):
                 fail("context menu (popover) did not appear")
             log(f"    popover window: {popover}")
 
-            # Click the second item ("Other"). Button heights are derived from
-            # the popover height: 3 items (Open/Other/Close) in a 6 px-margin
-            # box with 2 px spacing.
-            n_items = 3
-            margin, spacing = 6, 2
-            btn_h = (ph_ - 2 * margin - spacing * (n_items - 1)) / n_items
-            target_y = py + margin + (btn_h + spacing) + btn_h / 2  # item index 1
-            click_x, click_y = px + pw_ // 2, int(target_y)
-            log(f"    clicking popover item at ({click_x}, {click_y}); popover=({px},{py},{pw_}x{ph_}) btn_h={btn_h:.0f}")
-            subprocess.run(["xdotool", "mousemove", str(click_x), str(click_y)])
-            time.sleep(0.2)
-            subprocess.run(["xdotool", "click", "1"])
+            # Activate the second item ("Other") via keyboard navigation
+            # (robust: no geometry guessing). GtkMenu grabs the keyboard;
+            # Down moves the selection, Return activates.
+            time.sleep(0.3)
+            subprocess.run(["xdotool", "key", "Down"])
+            time.sleep(0.15)
+            subprocess.run(["xdotool", "key", "Down"])
+            time.sleep(0.15)
+            subprocess.run(["xdotool", "key", "Return"])
             try:
                 msg = conn.recv_until_filtered(matches, timeout=3.0)
             except TimeoutError:

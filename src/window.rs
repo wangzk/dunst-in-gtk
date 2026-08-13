@@ -295,12 +295,20 @@ impl NotificationWindow {
         window.set_keep_above(true);
         window.set_skip_taskbar_hint(true);
         window.set_skip_pager_hint(true);
-        // Note: no set_app_paintable(true) — with it, GTK3 skips drawing
-        // the whole window unless the app paints the background itself,
-        // which left notifications completely black on a real WM (Xvfb
-        // hid the bug because its root capture forced full redraws).
-        // Without it the theme paints the window background and the CSS
-        // on the inner box (background/border/radius) still applies.
+        // Real translucency needs an ARGB visual, which requires a
+        // compositor (picom). With one, the rgba background alpha shows
+        // through to the desktop (picom applies blur/shadow); without
+        // one, gdk returns no rgba visual and the theme background is
+        // used instead (GTK pre-mixes the rgba onto it — still readable).
+        // app_paintable tells GTK not to paint the window background so
+        // the alpha is not flattened by a theme background fill.
+        if let Some(screen) = gtk::gdk::Screen::default() {
+            if let Some(visual) = screen.rgba_visual() {
+                window.set_visual(Some(&visual));
+                window.set_app_paintable(true);
+                log::debug!("window uses ARGB visual (compositor present)");
+            }
+        }
         window.style_context().add_class("notification");
 
         // NOTE: widget-level add_provider() does not apply CSS on this

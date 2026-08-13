@@ -37,8 +37,8 @@ gap_size = 8
 # 圆角半径，像素
 corner_radius = 0
 
-# 边框宽度，像素
-frame_width = 3
+# 边框宽度，像素（默认 0 = 无边框）
+frame_width = 0
 
 # 边框颜色（十六进制 #rrggbb 或 #rrggbbaa）
 frame_color = #aaaaaa
