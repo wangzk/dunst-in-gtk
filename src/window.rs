@@ -20,6 +20,8 @@ use gtk::prelude::*;
 use crate::config::{
     Alignment, Color, Config, Ellipsize, IconPosition, Markup, VerticalAlignment,
 };
+
+
 use crate::dbus::{DBUS_IFACE, DBUS_PATH};
 
 /// Resolved per-notification visual style, derived from the config.
@@ -132,15 +134,21 @@ window.notification progressbar progress {{
 "#
         );
     }
+    // NOTE: never set a background on the `window.notification` node —
+    // GTK3 then skips redrawing the whole window (contents stay black on
+    // a real WM). The window background is the theme's; the inner box
+    // carries the notification background/border/radius. Padding on the
+    // box keeps the background/border filling the whole window (content
+    // inset), matching dunst's look.
+    let padding = style.padding.max(0);
+    let hpad = style.h_padding.max(0);
     format!(
         r#"
-window.notification {{
-    background-color: transparent;
-}}
 window.notification > box.notification {{
     background-color: {bg};
     border: {fw}px solid {frame};
     border-radius: {radius}px;
+    padding: {padding}px {hpad}px;
 }}
 window.notification label {{
     color: {fg};
@@ -287,17 +295,30 @@ impl NotificationWindow {
         window.set_keep_above(true);
         window.set_skip_taskbar_hint(true);
         window.set_skip_pager_hint(true);
-        // Needed so the CSS background (with alpha) paints over the default
-        // window background.
-        window.set_app_paintable(true);
+        // Note: no set_app_paintable(true) — with it, GTK3 skips drawing
+        // the whole window unless the app paints the background itself,
+        // which left notifications completely black on a real WM (Xvfb
+        // hid the bug because its root capture forced full redraws).
+        // Without it the theme paints the window background and the CSS
+        // on the inner box (background/border/radius) still applies.
         window.style_context().add_class("notification");
 
-        let css = gtk::CssProvider::new();
-        css.load_from_data(style_css(style).as_bytes()).expect("style CSS");
-        window.style_context().add_provider(
-            &css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+        // NOTE: widget-level add_provider() does not apply CSS on this
+        // system's GTK3 (3.24.52) — styles were silently ignored (verified
+        // with a minimal C program). Screen-level providers work; a fresh
+        // provider per notification wins over earlier ones (same priority,
+        // later addition wins in GTK3), so style updates apply.
+        if let Some(screen) = gtk::gdk::Screen::default() {
+            let css = gtk::CssProvider::new();
+            if let Err(e) = css.load_from_data(style_css(style).as_bytes()) {
+                log::warn!("CSS load error: {e}");
+            }
+            gtk::StyleContext::add_provider_for_screen(
+                &screen,
+                &css,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
 
         let font_desc = pango::FontDescription::from_string(&style.font);
         let font_attrs = pango::AttrList::new();
@@ -346,10 +367,6 @@ impl NotificationWindow {
             text_box.style_context().add_class("notification");
             text_box.upcast()
         };
-        child.set_margin_top(style.padding);
-        child.set_margin_bottom(style.padding);
-        child.set_margin_start(style.h_padding);
-        child.set_margin_end(style.h_padding);
         window.add(&child);
         let content_widget: gtk::Widget = child.clone().upcast();
 
@@ -447,9 +464,7 @@ impl NotificationWindow {
             }
             let on_event = Rc::clone(&on_event);
             let key = key.clone();
-            let key_log = key.clone();
             item.connect_activate(move |_| {
-                log::debug!("menu item activated: {key_log}");
                 (on_event.borrow())(WindowEvent::Action(id, key.clone()));
             });
             menu.append(&item);
