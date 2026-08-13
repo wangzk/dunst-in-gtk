@@ -332,13 +332,15 @@ impl NotificationWindow {
         let font_attrs = pango::AttrList::new();
         font_attrs.insert(pango::AttrFontDesc::new(&font_desc));
 
+        // The summary is always bold, via a Pango attribute (not the
+        // markup <b> tag, which would be escaped when markup=no).
+        let summary_attrs = pango::AttrList::new();
+        summary_attrs.insert(pango::AttrFontDesc::new(&font_desc));
+        summary_attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
         let summary_label = gtk::Label::new(None);
-        summary_label.set_markup(&format!(
-            "<b>{}</b>",
-            render_text(style.markup, &content.summary)
-        ));
+        summary_label.set_markup(&render_text(style.markup, &content.summary));
         summary_label.set_halign(align_of(style.alignment));
-        summary_label.set_attributes(Some(&font_attrs));
+        summary_label.set_attributes(Some(&summary_attrs));
 
         let body_label = gtk::Label::new(None);
         body_label.set_markup(&render_text(style.markup, &content.body));
@@ -513,12 +515,12 @@ impl NotificationWindow {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
-        self.summary_label.set_attributes(Some(&self.font_attrs));
+        let mut summary_attrs = self.font_attrs.clone();
+        summary_attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+        self.summary_label.set_attributes(Some(&summary_attrs));
         self.body_label.set_attributes(Some(&self.font_attrs));
-        self.summary_label.set_markup(&format!(
-            "<b>{}</b>",
-            render_text(style.markup, &content.summary)
-        ));
+        self.summary_label
+            .set_markup(&render_text(style.markup, &content.summary));
         self.summary_label.set_halign(align_of(style.alignment));
         self.body_label
             .set_markup(&render_text(style.markup, &content.body));
