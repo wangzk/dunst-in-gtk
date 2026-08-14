@@ -35,6 +35,8 @@ pub struct HistoryEntry {
     /// Progress 0-100 from the `value` hint; None = no progress bar.
     pub value: Option<i32>,
     pub timestamp: u64,
+    /// Generation time (unix seconds), kept for history re-display.
+    pub created: u64,
     pub client: Option<String>,
 }
 
@@ -60,8 +62,17 @@ pub enum HistoryAction {
     Remove(u32),
 }
 use crate::window::{
-    emit_action_invoked, emit_closed_signal, EventCb, NotificationContent, NotificationWindow, WindowStyle,
+    emit_action_invoked, emit_closed_signal, EventCb, NotificationContent, NotificationWindow,
+    WindowStyle,
 };
+
+/// Current time in unix seconds.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 // GTK-side daemon state. Lives in a thread-local: everything here is owned
 // and touched exclusively by the GTK main thread (windows are !Send).
@@ -249,6 +260,7 @@ impl Daemon {
                     expire_timeout: entry.expire_timeout,
                     urgency: entry.urgency,
                     value: entry.value,
+                    timestamp: entry.created,
                 };
                 match self.queue.notify(&pending) {
                     NotifyAction::ShowNow => self.create_window_from(pending),
@@ -269,7 +281,12 @@ impl Daemon {
             }
             CmdAction::CloseAll => self.close_all(),
             CmdAction::ContextMenu => {
-                if let Some((nw, _)) = self.windows.iter().max_by_key(|(id, _)| *id).map(|(_, v)| v) {
+                if let Some((nw, _)) = self
+                    .windows
+                    .iter()
+                    .max_by_key(|(id, _)| *id)
+                    .map(|(_, v)| v)
+                {
                     nw.show_context_menu();
                 }
             }
@@ -296,6 +313,7 @@ impl Daemon {
                     summary: pending.summary.clone(),
                     body: pending.body.clone(),
                     value: pending.value,
+                    timestamp: pending.timestamp,
                 };
                 nw.update_content(&content, &style);
             }
@@ -318,7 +336,13 @@ impl Daemon {
         }
         let deadline = Instant::now() + Duration::from_millis(ms);
         let source = Self::spawn_timeout_source(id, deadline);
-        self.timeouts.insert(id, TimeoutState { deadline, source: Some(source) });
+        self.timeouts.insert(
+            id,
+            TimeoutState {
+                deadline,
+                source: Some(source),
+            },
+        );
     }
 
     fn spawn_timeout_source(id: u32, deadline: Instant) -> glib::SourceId {
@@ -451,10 +475,8 @@ impl Daemon {
                 urgency: pending.urgency,
                 expire_timeout: pending.expire_timeout,
                 value: pending.value,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                created: pending.timestamp,
+                timestamp: now_secs(),
                 client: pending.client,
             });
             self.counters.displayed.fetch_sub(1, Ordering::Relaxed);
@@ -512,6 +534,7 @@ impl Daemon {
         urgency: u8,
         value: Option<i32>,
     ) {
+        let timestamp = now_secs();
         let pending = Pending {
             id,
             app_name: app_name.to_string(),
@@ -523,6 +546,7 @@ impl Daemon {
             expire_timeout,
             urgency,
             value,
+            timestamp,
         };
 
         // replaces_id: update in place (waiting or displayed) instead of
@@ -545,11 +569,13 @@ impl Daemon {
                 slot.expire_timeout = expire_timeout;
                 slot.client = client.clone();
                 slot.value = value;
+                slot.timestamp = timestamp;
                 let content = NotificationContent {
                     app_icon: app_icon.to_string(),
                     summary: summary.to_string(),
                     body: body.to_string(),
                     value,
+                    timestamp,
                 };
                 nw.update_content(&content, &style);
                 hovered = nw.is_hovered();
@@ -587,20 +613,14 @@ impl Daemon {
             summary: pending.summary.clone(),
             body: pending.body.clone(),
             value: pending.value,
+            timestamp: pending.timestamp,
         };
         let style = WindowStyle::from_config(&self.config, pending.urgency);
         let on_event: EventCb = Rc::new(RefCell::new(Box::new(|event| {
             with_daemon(|d| d.handle_window_event(event));
         })));
-        let nw = NotificationWindow::new(
-            id,
-            &app_name,
-            &content,
-            actions,
-            client,
-            on_event,
-            &style,
-        );
+        let nw =
+            NotificationWindow::new(id, &app_name, &content, actions, client, on_event, &style);
         self.arm_timeout(id, timeout_ms);
         self.windows.insert(id, (nw, pending));
         self.counters.displayed.fetch_add(1, Ordering::Relaxed);
@@ -643,10 +663,8 @@ impl Daemon {
                 urgency: pending.urgency,
                 expire_timeout: pending.expire_timeout,
                 value: pending.value,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                created: pending.timestamp,
+                timestamp: now_secs(),
                 client: pending.client,
             });
             nw.destroy();
@@ -736,7 +754,9 @@ fn resolve_monitor(cfg: &Config) -> Option<MonitorGeometry> {
                 .and_then(|seat| seat.pointer())
                 .and_then(|dev| dev.window_at_position().0);
             match window {
-                Some(w) => display.monitor_at_window(&w).or_else(|| monitors.first().cloned()),
+                Some(w) => display
+                    .monitor_at_window(&w)
+                    .or_else(|| monitors.first().cloned()),
                 None => monitors.first().cloned(),
             }
         }
@@ -744,11 +764,18 @@ fn resolve_monitor(cfg: &Config) -> Option<MonitorGeometry> {
         Follow::Keyboard | Follow::None => match &cfg.global.monitor {
             Monitor::Number(n) => {
                 let n = (*n).max(0) as usize;
-                monitors.get(n).cloned().or_else(|| monitors.first().cloned())
+                monitors
+                    .get(n)
+                    .cloned()
+                    .or_else(|| monitors.first().cloned())
             }
             Monitor::Name(name) => monitors
                 .iter()
-                .find(|m| m.model().map(|c| c.contains(name.as_str())).unwrap_or(false))
+                .find(|m| {
+                    m.model()
+                        .map(|c| c.contains(name.as_str()))
+                        .unwrap_or(false)
+                })
                 .cloned()
                 .or_else(|| monitors.first().cloned()),
         },

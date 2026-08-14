@@ -17,8 +17,11 @@
 //!   loads the icon at `pixel_size x scale_factor`, so HiDPI is automatic
 //!   and vector icons stay crisp
 //! - file icons (`image-path`): GtkImage's pixel-size does not apply to
-//!   pixbufs, so we scale the pixbuf ourselves to the physical target
-//!   (`target x scale`, dunst does the same)
+//!   pixbufs, and GtkImage renders a pixbuf at its pixel size *in logical
+//!   pixels* (then re-scales by the window scale factor). We scale the
+//!   pixbuf to the physical target (`target x scale`) and hand it to GTK as
+//!   a cairo surface with that device scale, so it draws at `target` logical
+//!   (= `target x scale` physical) instead of double-scaling.
 
 use gtk::pango;
 use gtk::prelude::*;
@@ -95,6 +98,12 @@ fn theme_icon(name: &str, app_name: &str, style: &WindowStyle) -> Option<gtk::Wi
 
 /// Load an icon from a file path. GtkImage's pixel-size does not apply to
 /// pixbufs, so scale the pixbuf to the physical target ourselves.
+/// Load an icon from a file path. GtkImage renders a pixbuf at its pixel
+/// size *in logical pixels* and then scales by the window's scale factor, so
+/// handing GTK a `target * scale` pixbuf would double-scale it. Instead we
+/// scale the pixbuf to the physical target and wrap it in a cairo surface
+/// whose device scale is the window scale — GTK then draws it at `target`
+/// logical (= `target * scale` physical), crisp and correctly sized.
 fn file_icon(path: &str, style: &WindowStyle, scale: i32) -> Option<gtk::Widget> {
     let pixbuf = match gtk::gdk_pixbuf::Pixbuf::from_file(path) {
         Ok(p) => p,
@@ -103,21 +112,22 @@ fn file_icon(path: &str, style: &WindowStyle, scale: i32) -> Option<gtk::Widget>
             return None;
         }
     };
-    let Some(target) = target_size(style) else {
-        // No configured size: show the pixbuf at its natural size.
-        let image = gtk::Image::from_pixbuf(Some(&pixbuf));
-        image.set_valign(gtk::Align::Center);
-        return Some(image.upcast());
-    };
-    let (w, h) = clamp_size(pixbuf.width(), pixbuf.height(), target * scale, target * scale);
-    let scaled = match pixbuf.scale_simple(w, h, gtk::gdk_pixbuf::InterpType::Bilinear) {
-        Some(s) => s,
-        None => {
-            log::warn!("cannot scale icon file {path:?}");
-            return None;
+    let scale = scale.max(1);
+    let surface = match target_size(style) {
+        Some(target) => {
+            let (w, h) = clamp_size(
+                pixbuf.width(),
+                pixbuf.height(),
+                target * scale,
+                target * scale,
+            );
+            let scaled = pixbuf.scale_simple(w, h, gtk::gdk_pixbuf::InterpType::Bilinear)?;
+            scaled.create_surface(scale, None::<&gtk::gdk::Window>)?
         }
+        // No configured size: the pixbuf at its natural physical size.
+        None => pixbuf.create_surface(scale, None::<&gtk::gdk::Window>)?,
     };
-    let image = gtk::Image::from_pixbuf(Some(&scaled));
+    let image = gtk::Image::from_surface(Some(&surface));
     image.set_valign(gtk::Align::Center);
     Some(image.upcast())
 }

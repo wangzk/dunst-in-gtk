@@ -17,10 +17,7 @@ use std::rc::Rc;
 use gtk::pango;
 use gtk::prelude::*;
 
-use crate::config::{
-    Alignment, Color, Config, Ellipsize, IconPosition, Markup, VerticalAlignment,
-};
-
+use crate::config::{Alignment, Color, Config, Ellipsize, IconPosition, Markup, VerticalAlignment};
 
 use crate::dbus::{DBUS_IFACE, DBUS_PATH};
 
@@ -144,7 +141,7 @@ window.notification progressbar progress {{
     let hpad = style.h_padding.max(0);
     format!(
         r#"
-window.notification > box.notification {{
+window.notification box.notification {{
     background-color: {bg};
     border: {fw}px solid {frame};
     border-radius: {radius}px;
@@ -152,6 +149,9 @@ window.notification > box.notification {{
 }}
 window.notification label {{
     color: {fg};
+}}
+window.notification label.time {{
+    color: #888888;
 }}
 {progress}"#
     )
@@ -200,7 +200,13 @@ pub fn emit_closed_signal(
 ) {
     log::info!("NotificationClosed id={id} reason={reason}");
     let dest = client.as_deref();
-    if let Err(e) = conn.emit_signal(dest, DBUS_PATH, DBUS_IFACE, "NotificationClosed", &(id, reason)) {
+    if let Err(e) = conn.emit_signal(
+        dest,
+        DBUS_PATH,
+        DBUS_IFACE,
+        "NotificationClosed",
+        &(id, reason),
+    ) {
         log::warn!("failed to emit NotificationClosed: {e}");
     }
 }
@@ -229,6 +235,9 @@ pub struct NotificationContent {
     pub body: String,
     /// Progress 0-100 from the `value` hint; None = no progress bar.
     pub value: Option<i32>,
+    /// When the notification was generated (unix seconds); rendered as a
+    /// small light-gray time label in the window's top-right corner.
+    pub timestamp: u64,
 }
 
 /// Remove every child of a container widget (GTK3 has `get_children`).
@@ -236,6 +245,48 @@ fn clear_children(container: &gtk::Container) {
     for child in container.children() {
         container.remove(&child);
     }
+}
+
+/// Format a unix timestamp as a local `HH:MM` string; None when the
+/// timestamp is missing or the local timezone is unavailable.
+fn format_time(timestamp: u64) -> Option<String> {
+    if timestamp == 0 {
+        return None;
+    }
+    let dt = glib::DateTime::from_unix_local(timestamp as i64).ok()?;
+    Some(dt.format("%H:%M").ok()?.to_string())
+}
+
+/// Set the time label text for `timestamp`, hiding it when unrenderable.
+fn apply_timestamp(label: &gtk::Label, timestamp: u64) {
+    match format_time(timestamp) {
+        Some(t) => {
+            label.set_text(&t);
+            label.show();
+        }
+        None => label.hide(),
+    }
+}
+
+/// Distance of the time label from the window's top and right edges
+/// (logical pixels).
+const TIME_LABEL_MARGIN_TOP: i32 = 6;
+const TIME_LABEL_MARGIN_END: i32 = 8;
+
+/// Place the time label at the overlay's top-right corner. GTK3's
+/// GtkOverlay pins overlay children to the top-left, so the position is
+/// applied manually; called from configure-event and content updates.
+fn position_time_label(overlay: &gtk::Overlay, label: &gtk::Label) {
+    let (width, height) = (overlay.allocated_width(), overlay.allocated_height());
+    let (_, natural) = label.preferred_size();
+    let x = (width - natural.width - TIME_LABEL_MARGIN_END).max(0);
+    let y = TIME_LABEL_MARGIN_TOP.min((height - natural.height).max(0));
+    label.size_allocate(&gtk::gdk::Rectangle::new(
+        x,
+        y,
+        natural.width,
+        natural.height,
+    ));
 }
 
 pub struct NotificationWindow {
@@ -268,6 +319,10 @@ pub struct NotificationWindow {
     /// returns NULL for a toplevel itself — the anchor must be a widget
     /// *inside* the window.
     content: gtk::Widget,
+    /// The overlay wrapping the content and the floating time label.
+    overlay: gtk::Overlay,
+    /// The time label floating at the window's top-right corner.
+    time_label: gtk::Label,
 }
 
 impl NotificationWindow {
@@ -377,7 +432,31 @@ impl NotificationWindow {
             text_box.style_context().add_class("notification");
             text_box.upcast()
         };
-        window.add(&child);
+        // The time label floats at the top-right corner as an overlay
+        // child (it does not affect the window's natural size). GTK3's
+        // GtkOverlay pins overlay children to the top-left, so the label
+        // is positioned manually after every configure (configure-event
+        // fires after the allocation pass; a synchronous reposition
+        // during size-allocate would be clobbered by the default handler).
+        let time_label = gtk::Label::new(None);
+        time_label.style_context().add_class("time");
+        time_label.set_attributes(Some(&font_attrs));
+        apply_timestamp(&time_label, content.timestamp);
+
+        let overlay = gtk::Overlay::new();
+        overlay.add(&child);
+        overlay.add_overlay(&time_label);
+        // The label never takes input: hover/click fall through.
+        overlay.set_overlay_pass_through(&time_label, true);
+        {
+            let overlay = overlay.clone();
+            let label = time_label.clone();
+            window.connect_configure_event(move |_, _| {
+                position_time_label(&overlay, &label);
+                false
+            });
+        }
+        window.add(&overlay);
         let content_widget: gtk::Widget = child.clone().upcast();
 
         let hovered = Rc::new(Cell::new(false));
@@ -397,6 +476,8 @@ impl NotificationWindow {
             hovered: Rc::clone(&hovered),
             popover: RefCell::new(None),
             content: content_widget,
+            overlay,
+            time_label,
         };
         nw.set_icon_and_progress(content, style);
 
@@ -509,11 +590,11 @@ impl NotificationWindow {
     /// Update the content in place (replaces_id) and re-apply the style.
     pub fn update_content(&self, content: &NotificationContent, style: &WindowStyle) {
         let css = gtk::CssProvider::new();
-        css.load_from_data(style_css(style).as_bytes()).expect("style CSS");
-        self.window.style_context().add_provider(
-            &css,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+        css.load_from_data(style_css(style).as_bytes())
+            .expect("style CSS");
+        self.window
+            .style_context()
+            .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
         let summary_attrs = self.font_attrs.clone();
         summary_attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
@@ -527,6 +608,9 @@ impl NotificationWindow {
         self.body_label.set_halign(align_of(style.alignment));
         self.body_label.set_wrap(style.word_wrap);
         self.body_label.set_ellipsize(ellipsize_of(style.ellipsize));
+        self.time_label.set_attributes(Some(&self.font_attrs));
+        apply_timestamp(&self.time_label, content.timestamp);
+        position_time_label(&self.overlay, &self.time_label);
         self.set_icon_and_progress(content, style);
     }
 
@@ -619,7 +703,12 @@ mod tests {
 
     fn style() -> WindowStyle {
         WindowStyle {
-            background: Color { r: 0, g: 0, b: 0, a: 0xcc },
+            background: Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0xcc,
+            },
             foreground: Color::rgb(0xff, 0xff, 0xff),
             frame_color: Color::rgb(0xff, 0, 0),
             corner_radius: 12,
@@ -704,5 +793,17 @@ mod tests {
         // Defaults: critical timeout 0, colors identical; style same but
         // timeout handled by the daemon. Just check frame color wiring.
         assert_eq!(low.frame_color, critical.frame_color);
+    }
+
+    #[test]
+    fn time_label_css_is_light_gray() {
+        let css = style_css(&style());
+        assert!(css.contains("label.time"), "{css}");
+        assert!(css.contains("#888888"), "{css}");
+    }
+
+    #[test]
+    fn format_time_hides_missing_timestamp() {
+        assert_eq!(format_time(0), None);
     }
 }

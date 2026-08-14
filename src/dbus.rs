@@ -350,7 +350,7 @@ impl Cmd0 {
                 );
                 m.insert("timeout".to_string(), Value::from(h.expire_timeout as i64));
                 m.insert("timestamp".to_string(), Value::from(h.timestamp as i64));
-                m.insert("progress".to_string(), Value::from(h.value.unwrap_or(-1) as i32));
+                m.insert("progress".to_string(), Value::from(h.value.unwrap_or(-1)));
                 m
             })
             .collect()
