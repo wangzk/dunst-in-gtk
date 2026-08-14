@@ -1,6 +1,6 @@
 [package]
 name = "dunst-in-gtk"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "A dunst-compatible notification daemon rendering notifications with GTK4 windows"
 

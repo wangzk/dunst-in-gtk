@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "dunst-in-gtk"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-channel",
  "env_logger",

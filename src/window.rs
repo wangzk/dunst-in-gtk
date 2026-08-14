@@ -269,31 +269,14 @@ fn apply_timestamp(label: &gtk::Label, timestamp: u64) {
 }
 
 /// Distance of the time label from the window's top and right edges
-/// (logical pixels).
+/// (logical pixels), applied as GtkOverlay margins.
 const TIME_LABEL_MARGIN_TOP: i32 = 6;
 const TIME_LABEL_MARGIN_END: i32 = 8;
-
-/// Place the time label at the overlay's top-right corner. GTK3's
-/// GtkOverlay pins overlay children to the top-left, so the position is
-/// applied manually; called from configure-event and content updates.
-fn position_time_label(overlay: &gtk::Overlay, label: &gtk::Label) {
-    let (width, height) = (overlay.allocated_width(), overlay.allocated_height());
-    let (_, natural) = label.preferred_size();
-    let x = (width - natural.width - TIME_LABEL_MARGIN_END).max(0);
-    let y = TIME_LABEL_MARGIN_TOP.min((height - natural.height).max(0));
-    label.size_allocate(&gtk::gdk::Rectangle::new(
-        x,
-        y,
-        natural.width,
-        natural.height,
-    ));
-}
 
 pub struct NotificationWindow {
     window: gtk::Window,
     summary_label: gtk::Label,
     body_label: gtk::Label,
-    font_attrs: pango::AttrList,
     /// The app name, used for the missing-icon placeholder letter.
     app_name: String,
     /// Holds the current icon widget; rebuilt on content updates.
@@ -319,8 +302,6 @@ pub struct NotificationWindow {
     /// returns NULL for a toplevel itself — the anchor must be a widget
     /// *inside* the window.
     content: gtk::Widget,
-    /// The overlay wrapping the content and the floating time label.
-    overlay: gtk::Overlay,
     /// The time label floating at the window's top-right corner.
     time_label: gtk::Label,
 }
@@ -383,14 +364,11 @@ impl NotificationWindow {
             );
         }
 
-        let font_desc = pango::FontDescription::from_string(&style.font);
-        let font_attrs = pango::AttrList::new();
-        font_attrs.insert(pango::AttrFontDesc::new(&font_desc));
+        let font_attrs = font_attr_list(&style.font);
 
         // The summary is always bold, via a Pango attribute (not the
         // markup <b> tag, which would be escaped when markup=no).
-        let summary_attrs = pango::AttrList::new();
-        summary_attrs.insert(pango::AttrFontDesc::new(&font_desc));
+        let summary_attrs = font_attr_list(&style.font);
         summary_attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
         let summary_label = gtk::Label::new(None);
         summary_label.set_markup(&render_text(style.markup, &content.summary));
@@ -433,14 +411,18 @@ impl NotificationWindow {
             text_box.upcast()
         };
         // The time label floats at the top-right corner as an overlay
-        // child (it does not affect the window's natural size). GTK3's
-        // GtkOverlay pins overlay children to the top-left, so the label
-        // is positioned manually after every configure (configure-event
-        // fires after the allocation pass; a synchronous reposition
-        // during size-allocate would be clobbered by the default handler).
+        // child (it does not affect the window's natural size). GtkOverlay
+        // positions overlay children by their halign/valign plus margins,
+        // so pinning it with End/Start is stable across reflows — unlike a
+        // manual size_allocate, which the overlay's next allocation clobbers
+        // (the label then reverts to fill/center).
         let time_label = gtk::Label::new(None);
         time_label.style_context().add_class("time");
         time_label.set_attributes(Some(&font_attrs));
+        time_label.set_halign(gtk::Align::End);
+        time_label.set_valign(gtk::Align::Start);
+        time_label.set_margin_top(TIME_LABEL_MARGIN_TOP);
+        time_label.set_margin_end(TIME_LABEL_MARGIN_END);
         apply_timestamp(&time_label, content.timestamp);
 
         let overlay = gtk::Overlay::new();
@@ -448,14 +430,6 @@ impl NotificationWindow {
         overlay.add_overlay(&time_label);
         // The label never takes input: hover/click fall through.
         overlay.set_overlay_pass_through(&time_label, true);
-        {
-            let overlay = overlay.clone();
-            let label = time_label.clone();
-            window.connect_configure_event(move |_, _| {
-                position_time_label(&overlay, &label);
-                false
-            });
-        }
         window.add(&overlay);
         let content_widget: gtk::Widget = child.clone().upcast();
 
@@ -464,7 +438,6 @@ impl NotificationWindow {
             window,
             summary_label,
             body_label,
-            font_attrs,
             app_name: app_name.to_string(),
             icon_slot,
             progress_slot,
@@ -476,7 +449,6 @@ impl NotificationWindow {
             hovered: Rc::clone(&hovered),
             popover: RefCell::new(None),
             content: content_widget,
-            overlay,
             time_label,
         };
         nw.set_icon_and_progress(content, style);
@@ -596,10 +568,14 @@ impl NotificationWindow {
             .style_context()
             .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let summary_attrs = self.font_attrs.clone();
+        // Fresh attribute lists per label: `font_attrs.clone()` would share
+        // the underlying list, so inserting the summary's bold weight would
+        // also make the body and time labels bold.
+        let font_attrs = font_attr_list(&style.font);
+        let summary_attrs = font_attr_list(&style.font);
         summary_attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
         self.summary_label.set_attributes(Some(&summary_attrs));
-        self.body_label.set_attributes(Some(&self.font_attrs));
+        self.body_label.set_attributes(Some(&font_attrs));
         self.summary_label
             .set_markup(&render_text(style.markup, &content.summary));
         self.summary_label.set_halign(align_of(style.alignment));
@@ -608,9 +584,8 @@ impl NotificationWindow {
         self.body_label.set_halign(align_of(style.alignment));
         self.body_label.set_wrap(style.word_wrap);
         self.body_label.set_ellipsize(ellipsize_of(style.ellipsize));
-        self.time_label.set_attributes(Some(&self.font_attrs));
+        self.time_label.set_attributes(Some(&font_attrs));
         apply_timestamp(&self.time_label, content.timestamp);
-        position_time_label(&self.overlay, &self.time_label);
         self.set_icon_and_progress(content, style);
     }
 
@@ -679,6 +654,18 @@ impl NotificationWindow {
             self.presented.set(true);
         }
     }
+}
+
+/// Build a Pango attribute list applying `font` at regular weight.
+/// Every label needs its own list: `AttrList` clones are shallow (they share
+/// the underlying PangoAttrList), so a fresh list must be built per label —
+/// otherwise inserting the summary's bold weight would also bold the body
+/// and time labels.
+fn font_attr_list(font: &str) -> pango::AttrList {
+    let desc = pango::FontDescription::from_string(font);
+    let attrs = pango::AttrList::new();
+    attrs.insert(pango::AttrFontDesc::new(&desc));
+    attrs
 }
 
 fn align_of(a: Alignment) -> gtk::Align {
