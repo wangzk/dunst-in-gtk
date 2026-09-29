@@ -2,3 +2,10 @@
 .pi/
 __pycache__/
 *.pyc
+
+# Local CARGO_HOME: used when ~/.cargo is not writable (containers/sandboxes)
+/.cargo-home/
+
+# Ad-hoc probe artifacts under .scratch (the tickets themselves stay tracked)
+/.scratch/*.png
+/.scratch/*.log
