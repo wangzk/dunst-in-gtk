@@ -4,7 +4,7 @@
 
 - **协议兼容**：`org.freedesktop.Notifications`（Notify / CloseNotification / GetCapabilities / GetServerInformation）+ dunst 扩展接口 `org.dunstproject.cmd0`（dunstctl 直接可用）
 - **配置兼容**：读取 dunst 的 `dunstrc`（新格式 `width/height/origin/offset` 与旧格式 `geometry` 都支持）
-- **渲染**：GTK3 无装饰窗口、官方 EWMH 提示（`type_hint`/`keep_above`/`accept_focus` 等）、角落堆叠布局、图标（主题/文件）、Pango markup、进度条、动作菜单
+- **渲染**：GTK3 无装饰窗口 + 经典顶层提示（`type_hint`/`keep_above`/`accept_focus` 等），并设为 **override-redirect**（窗口管理器完全不接管通知窗口，所以焦点在别的输出时也能稳定落在指定显示器上——i3 会把新建的浮动窗口搬到焦点输出）、角落堆叠布局、图标（主题/文件）、Pango markup、进度条、动作菜单
 
 ## 构建
 

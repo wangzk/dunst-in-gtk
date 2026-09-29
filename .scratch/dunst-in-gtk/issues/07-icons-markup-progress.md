@@ -21,3 +21,8 @@
   - dbus 接线对照 dunst 源码核实：`value` hint 接受 INT32/UINT32、负值=无进度条（history 存 -1）；`image-path`/`image_path` 覆盖 app_icon；`body-markup` 能力**条件声明**（`markup != no` 时，dunst 同款逻辑）。
   - 进度条样式：progress_bar_height/min_width/max_width 进 CSS；`progress_bar_frame_width` 用配置值（<0 时继承 frame_width）；`value` 经 replaces_id 原地更新。
   - markup=no 时字面量文本更宽（集成测试 55px vs 87px 窗口宽度差验证转义生效）。
+
+- 2026-09-29: 真机（i3, DISPLAY=:0）跑集成测试时，图标像素断言暴露两个**测试侧**问题（产品行为本身正确）：
+  1. **图标主题相关**：断言"firefox 图标必须是橙色"在本机不成立——活动图标主题是用户的 `Chicago95`，其 `firefox.png` 是完全不同的像素画（蓝白格+彩色星形），程序把它忠实渲染了出来。用文件路径加载同一个 hicolor `firefox.png` 验证渲染管线正常（370 个橙色像素，图像正确），说明不是渲染缺陷。另外 `gtk-icon-theme-name` 在本环境（无 XSettings 守护、settings.ini 被忽略）无法用于固定主题——伪造主题名也不生效。→ 断言改为**主题无关**：检查图标列画出了"彩色图形"（`count_colorful`，饱和像素；字母占位符是黑灰不饱和），不再检查具体品牌色；HiDPI 用例改为比较彩色带的相对高度（48px → 96px，实测通过）。
+  2. **像素扫描必须限制在窗口内**：窗口不一定在 root 画面左上角（多屏时原点可能是 2160,10 等），且扫描框超出窗口会读到桌面壁纸（本机蓝色壁纸曾被当成"彩色像素"，导致 no-icon 用例假失败）。→ 所有扫描用 `window_box()`（xdotool 实际几何）作为裁剪原点与尺寸。
+  - 顺带修正：`theme_icon()` 原先用 `gtk::IconTheme::new()`（文档上面向自定义主题的独立对象），改为 `IconTheme::for_screen()`（控件实际使用的主题，跟随用户设置）；并加了一条 debug 日志打印解析到的图标文件路径，便于区分"主题里没有该图标"和"渲染问题"。另修正了 monitor 名称用例的配置模板 bug（生成 `monitor = monitor = 0`，导致名称路径从未真正被测到）。

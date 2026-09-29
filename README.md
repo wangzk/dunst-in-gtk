@@ -4,7 +4,7 @@ A [dunst](https://dunst-project.org/)-compatible desktop notification daemon wri
 
 - **Protocol compatible**: `org.freedesktop.Notifications` (Notify / CloseNotification / GetCapabilities / GetServerInformation) plus the dunst extension interface `org.dunstproject.cmd0` (works with `dunstctl` out of the box)
 - **Config compatible**: reads dunst's `dunstrc` (both the new `width/height/origin/offset` format and the legacy `geometry` format)
-- **Rendering**: borderless GTK3 windows with official EWMH hints (`type_hint` / `keep_above` / `accept_focus`, …), corner-stacking layout, icons (theme / file), Pango markup, progress bars, action menus
+- **Rendering**: borderless GTK3 windows with the classic toplevel hints (`type_hint` / `keep_above` / `accept_focus`, …) plus **override-redirect**: the window manager never manages notification windows, so they stay on the configured monitor even when another output has the focus (i3 otherwise relocates new floating windows onto the focused output); corner-stacking layout, icons (theme / file), Pango markup, progress bars, action menus
 
 ## Building
 
