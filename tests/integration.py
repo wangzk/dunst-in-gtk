@@ -14,6 +14,7 @@ Usage: tests/integration.py [path-to-binary]
 """
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -179,6 +180,49 @@ def wait_window_count(title, n, timeout=5.0):
     return False
 
 
+def xrandr_monitors():
+    """[(name, x, y, w, h, primary)] for every connected output (X11).
+
+    The geometry assertions below are derived from this instead of hardcoded
+    Xvfb coordinates, so the suite also runs against a real multi-monitor
+    session (`DISPLAY=:0 ... --inside`).
+    """
+    out = subprocess.run(["xrandr", "--query"], capture_output=True, text=True).stdout
+    mons = []
+    for line in out.splitlines():
+        m = re.match(
+            r"^(\S+) connected (primary )?(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", line
+        )
+        if m:
+            mons.append(
+                (
+                    m.group(1),
+                    int(m.group(5)),
+                    int(m.group(6)),
+                    int(m.group(3)),
+                    int(m.group(4)),
+                    bool(m.group(2)),
+                )
+            )
+    return mons
+
+
+def monitor_with_right_edge(right, top):
+    """(x, y, w, h) of the monitor whose right edge/top are `right`/`top`."""
+    for _name, x, y, w, h, _primary in xrandr_monitors():
+        if x + w == right and y == top:
+            return (x, y, w, h)
+    return None
+
+
+def monitor_at_origin(x, y):
+    """(x, y, w, h) of the monitor whose top-left is exactly (x, y)."""
+    for _name, mx, my, w, h, _primary in xrandr_monitors():
+        if mx == x and my == y:
+            return (mx, my, w, h)
+    return None
+
+
 def wait_window_geometry(title, n, timeout=5.0):
     """Wait until `n` windows with real geometry exist; return their geoms.
 
@@ -219,8 +263,17 @@ def test_layout(binary, conn):
         if len(geoms) != 1:
             fail("first notification window missing")
         x0, y0, w0, h0 = geoms[0]
-        if (x0, w0) != (1070, 200):
-            fail(f"expected top-right at x=1070 w=200 (1280-10-200), got {geoms}")
+        if w0 != 200:
+            fail(f"expected width 200 (width spec), got {geoms}")
+        # The daemon places on a monitor (default: monitor 0, whatever GDK
+        # reports); identify it from the placement itself so the assertion
+        # holds on any display size / monitor count.
+        mon = monitor_with_right_edge(x0 + w0 + 10, y0 - 10)
+        if mon is None:
+            fail(f"expected top-right of a monitor with offset 10, got {geoms}")
+        mon_x, mon_y, mon_w, _mon_h = mon
+        if (x0, y0) != (mon_x + mon_w - 10 - 200, mon_y + 10):
+            fail(f"expected top-right at x={mon_x + mon_w - 210} y={mon_y + 10}, got {geoms}")
 
         nid_b = notify(conn, "itest", "Second", "BBB", 5000)
         geoms = wait_window_geometry("dunst-in-gtk itest", 2)
@@ -239,8 +292,8 @@ def test_layout(binary, conn):
         if not wait_window_count("dunst-in-gtk itest", 1):
             fail("window count did not drop after close")
         geoms = window_geoms("dunst-in-gtk itest")
-        if len(geoms) != 1 or geoms[0][1] != 10:
-            fail(f"expected reflow to y=10, got {geoms}")
+        if len(geoms) != 1 or geoms[0][1] != mon_y + 10:
+            fail(f"expected reflow to y={mon_y + 10}, got {geoms}")
 
         close_notification(conn, nid_b)
         if not wait_window_count("dunst-in-gtk itest", 0):
@@ -265,8 +318,17 @@ def test_hidpi(binary, conn):
             fail("hidpi notification window missing")
         x, y, w, h = geoms[0]
         # 200 logical px -> 400 physical; offset 10 logical -> 20 physical.
-        if (w, x, y) != (400, 860, 20):
-            fail(f"expected physical (400, 860, 20) for logical 200@scale2, got {geoms}")
+        # With GDK_SCALE=2 the logical monitor space is the xrandr rect / 2,
+        # so the physical top-right is still `right_edge - (10+200)*2`.
+        if w != 400:
+            fail(f"expected physical width 400 for logical 200@scale2, got {geoms}")
+        mon = monitor_with_right_edge(x + 420, y - 20)
+        if mon is None:
+            fail(f"expected top-right of a monitor (scale 2), got {geoms}")
+        mon_x, mon_y, mon_w, _mon_h = mon
+        expected = (mon_x + mon_w - 420, mon_y + 20)
+        if (x, y) != expected:
+            fail(f"expected physical {expected} for logical 200@scale2, got {geoms}")
     finally:
         daemon.stop()
     pass_("GDK_SCALE=2 doubles the physical size and offsets")
@@ -298,47 +360,71 @@ def shot(path):
     subprocess.run(["import", "-window", "root", path], check=True)
 
 
-def window_pixels(path, xmax=500, ymax=400):
-    """Return (w, h, px) of the root screenshot plus a 2D pixel array.
+def window_origin(title="dunst-in-gtk t07"):
+    """Top-left of the first matching window (pixel scans are cropped here).
 
-    px[y][x] is a (r, g, b) tuple; scans are limited to the top-left
-    corner where the top-left-origin test window lives."""
+    The notification is not necessarily at the root window's top-left corner:
+    on a real multi-monitor session the selected monitor can start at any
+    offset, so every pixel scan is anchored at the window itself."""
+    return window_box(title)[:2]
+
+
+def window_box(title="dunst-in-gtk t07"):
+    """(x, y, w, h) of the first matching window.
+
+    Pixel scans must also be *limited* to the window: scanning past its edges
+    picks up the desktop/wallpaper (which made a "no icon" check fail on a
+    machine with a colored wallpaper)."""
+    geoms = window_geoms(title)
+    if not geoms:
+        fail(f"window {title!r} not found for pixel scan")
+    return geoms[0]
+
+
+def window_pixels(path, xmax=500, ymax=400, origin=(0, 0)):
+    """Return (w, h, px) of the root screenshot cropped at `origin`.
+
+    px[y][x] is a (r, g, b) tuple relative to `origin` (the notification
+    window's top-left corner)."""
     from PIL import Image
 
     im = Image.open(path).convert("RGB")
+    im = im.crop((origin[0], origin[1], origin[0] + xmax, origin[1] + ymax))
     w, h = im.size
     return w, h, im.load()
 
 
-def bbox_of(px, xmax, ymax, step=2):
-    """Bounding box of non-background pixels (background = pure black/white)."""
-    minx, miny, maxx, maxy = xmax, ymax, -1, -1
-    for y in range(0, ymax, step):
-        for x in range(0, xmax, step):
-            r, g, b = px[x, y]
-            if not (r > 250 and g > 250 and b > 250) and not (r < 6 and g < 6 and b < 6):
-                minx, miny = min(minx, x), min(miny, y)
-                maxx, maxy = max(maxx, x), max(maxy, y)
-    return (minx, miny, maxx, maxy)
+def is_colorful(rgb, min_delta=60):
+    """Clearly colored pixel (not the gray notification background / black
+    text)."""
+    r, g, b = rgb
+    return max(r, g, b) - min(r, g, b) >= min_delta
 
 
-def count_orange(px, xmax, ymax):
-    """Firefox-brand orange pixels (r>200, 90<g<190, b<100)."""
+def count_colorful(px, xmax, ymax, min_delta=60):
+    """Count colored pixels.
+
+    Icon assertions must not depend on the developer's icon theme: a retro
+    theme can ship a completely different "firefox" glyph (Chicago95 does, for
+    example), so the tests check that an icon *graphic* was drawn (saturated
+    pixels) rather than a specific brand color. The letter placeholder shown
+    for a missing icon is black on the notification background, i.e.
+    unsaturated, so it does not count."""
     n = 0
     for y in range(0, ymax):
         for x in range(0, xmax):
-            r, g, b = px[x, y]
-            if r > 200 and 90 < g < 190 and b < 100:
+            if is_colorful(px[x, y], min_delta):
                 n += 1
     return n
 
 
-def diff_pixels(path_a, path_b, xmax=500, ymax=400, step=1):
+def diff_pixels(path_a, path_b, xmax=500, ymax=400, step=1, origin=(0, 0)):
     """Count pixels that differ between two screenshots (scaled: step 1)."""
     from PIL import Image
 
-    a = Image.open(path_a).convert("RGB").load()
-    b = Image.open(path_b).convert("RGB").load()
+    box = (origin[0], origin[1], origin[0] + xmax, origin[1] + ymax)
+    a = Image.open(path_a).convert("RGB").crop(box).load()
+    b = Image.open(path_b).convert("RGB").crop(box).load()
     n = 0
     for y in range(0, ymax, step):
         for x in range(0, xmax, step):
@@ -363,15 +449,18 @@ def test_icons_markup_progress(binary, conn):
         if not wait_until_name_owned(conn, timeout=5.0):
             fail("t07 daemon did not acquire the bus name")
 
-        # --- 1. themed icon renders (firefox exists in hicolor) ---
+        # --- 1. themed icon renders (theme-independent: an icon graphic is
+        #        drawn, whatever glyph the active icon theme provides) ---
         nid = notify(conn, "t07", "icon", "body", 5000, icon="firefox")
         if not wait_for_window("dunst-in-gtk t07"):
             fail("icon notification window missing")
         time.sleep(0.4)
         shot(os.path.join(tmp, "t07-icon.png"))
-        _, _, px = window_pixels(os.path.join(tmp, "t07-icon.png"))
-        if count_orange(px, 200, 120) < 40:
-            fail("firefox theme icon did not render (no orange pixels)")
+        bx, by, bw, bh = window_box()
+        _, _, px = window_pixels(os.path.join(tmp, "t07-icon.png"),
+                                 xmax=bw, ymax=bh, origin=(bx, by))
+        if count_colorful(px, bw, bh) < 40:
+            fail("theme icon did not render (no icon graphic drawn)")
         close_notification(conn, nid)
         wait_no_window("dunst-in-gtk t07")
 
@@ -380,27 +469,34 @@ def test_icons_markup_progress(binary, conn):
         wait_for_window("dunst-in-gtk t07")
         time.sleep(0.4)
         shot(os.path.join(tmp, "t07-noicon.png"))
-        _, _, px = window_pixels(os.path.join(tmp, "t07-noicon.png"))
-        noicon_bb = bbox_of(px, 200, 120)
-        if count_orange(px, 200, 120) != 0:
-            fail("no-icon notification must not show a themed icon")
+        bx, by, bw, bh = window_box()
+        _, _, px = window_pixels(os.path.join(tmp, "t07-noicon.png"),
+                                 xmax=bw, ymax=bh, origin=(bx, by))
+        _, _, noicon_w, noicon_h = window_box()
+        # No icon requested: the icon *column* (left 48px + padding) must stay
+        # free of any icon graphic (text is unsaturated, so it does not count).
+        if count_colorful(px, min(60, bw), bh) != 0:
+            fail("no-icon notification must not draw an icon")
         close_notification(conn, nid)
         wait_no_window("dunst-in-gtk t07")
 
-        nid = notify(conn, "t07", "missing", "body", 5000, icon="dialog-information")
+        # An unknown icon name must still produce an icon column: the theme
+        # fallback icon ("dialog-information") or, when even that is missing,
+        # the letter placeholder. Which of the two it is depends on the icon
+        # theme, so assert the layout effect (a wider window) instead of a
+        # specific glyph. icon_position = left puts the icon beside the text,
+        # so the column widens the window rather than making it taller.
+        nid = notify(conn, "t07", "missing", "body", 5000,
+                     icon="definitely-not-an-icon-name-xyz")
         wait_for_window("dunst-in-gtk t07")
         time.sleep(0.4)
-        shot(os.path.join(tmp, "t07-missing.png"))
-        _, _, px = window_pixels(os.path.join(tmp, "t07-missing.png"))
-        miss_bb = bbox_of(px, 200, 120)
+        _mx, _my, miss_w, _mh = window_box()
         close_notification(conn, nid)
         wait_no_window("dunst-in-gtk t07")
-        # The placeholder letter sits in the 48px icon column, so the window
-        # must be noticeably taller than the no-icon window.
-        if miss_bb[3] - miss_bb[1] <= noicon_bb[3] - noicon_bb[1] + 12:
+        if miss_w < noicon_w + 20:
             fail(
-                f"missing icon should render a placeholder letter "
-                f"(window taller than no-icon: {miss_bb} vs {noicon_bb})"
+                f"icon fallback should keep an icon column "
+                f"(window width {miss_w} vs no-icon {noicon_w})"
             )
 
         # --- 3. progress bar from the `value` hint; replaces_id updates it ---
@@ -408,11 +504,13 @@ def test_icons_markup_progress(binary, conn):
         wait_for_window("dunst-in-gtk t07")
         time.sleep(0.4)
         shot(os.path.join(tmp, "t07-prog10.png"))
-        _, _, px = window_pixels(os.path.join(tmp, "t07-prog10.png"))
-        prog_bb = bbox_of(px, 220, 140)
+        bx, by, bw, bh = window_box()
+        _, _, px = window_pixels(os.path.join(tmp, "t07-prog10.png"),
+                                 xmax=bw, ymax=bh, origin=(bx, by))
+        _, _, _pw, prog_h = window_box()
         # Progress bar adds height beyond the plain text window.
-        if prog_bb[3] - prog_bb[1] <= noicon_bb[3] - noicon_bb[1] + 8:
-            fail(f"value hint should add a progress bar (window {prog_bb} vs plain {noicon_bb})")
+        if prog_h <= noicon_h + 8:
+            fail(f"value hint should add a progress bar (height {prog_h} vs plain {noicon_h})")
 
         # replaces_id: same id, value 10 -> 90; no new window, bar changes.
         nid2 = notify(conn, "t07", "progress", "body", 5000, icon="",
@@ -424,8 +522,9 @@ def test_icons_markup_progress(binary, conn):
         time.sleep(0.4)
         shot(os.path.join(tmp, "t07-prog90.png"))
         # The filled bar length changes 10% -> 90%: real pixel difference.
+        bx, by, bw, bh = window_box()
         d = diff_pixels(os.path.join(tmp, "t07-prog10.png"), os.path.join(tmp, "t07-prog90.png"),
-                        xmax=220, ymax=140)
+                        xmax=bw, ymax=bh, origin=(bx, by))
         if d < 80:
             fail(f"progress bar did not visually update on replaces_id (diff={d} px)")
         close_notification(conn, nid)
@@ -470,18 +569,15 @@ def test_icons_markup_progress(binary, conn):
     )
 
 
-def icon_band_heights(path, xmax=300, ymax=200):
-    """Y-extent of the firefox-orange pixels in a screenshot (the logo's
-    orange band inside the icon square).
+def icon_band_height(path, xmax=300, ymax=200, origin=(0, 0)):
+    """Y-extent of the colored icon pixels in a screenshot.
 
-    The firefox logo does not fill its square: at 48 logical px the orange
-    band is ~29 px tall, at 96 physical px it is ~55-58 px. The HiDPI test
-    therefore compares scale-2 against scale-1 band heights (≈2x) rather
-    than asserting an absolute pixel size.
+    An icon does not fill its square, and which glyph it is depends on the
+    icon theme, so the HiDPI test compares the scale-2 band height against
+    the scale-1 band height (≈2x) instead of asserting absolute pixels.
     """
-    _, _, px = window_pixels(path, xmax, ymax)
-    ys = [y for y in range(ymax) for x in range(xmax)
-          if px[x, y][0] > 200 and 90 < px[x, y][1] < 190 and px[x, y][2] < 100]
+    _, _, px = window_pixels(path, xmax, ymax, origin=origin)
+    ys = [y for y in range(ymax) for x in range(xmax) if is_colorful(px[x, y])]
     if not ys:
         return 0
     return max(ys) - min(ys) + 1
@@ -489,7 +585,7 @@ def icon_band_heights(path, xmax=300, ymax=200):
 
 def test_icons_hidpi(binary, conn):
     """GDK_SCALE=2: the 48px-logical icon renders at 2x the physical size
-    (orange band ~29px @ scale 1 -> ~58px @ scale 2)."""
+    (icon band height doubles from scale 1 to scale 2)."""
     log("== test: icon HiDPI scaling (GDK_SCALE=2) ==")
     tmp = os.environ.get("TMPDIR", "/tmp")
     cfg_path = os.path.join(tmp, "dig-t07-dunstrc")
@@ -505,40 +601,47 @@ def test_icons_hidpi(binary, conn):
             time.sleep(0.4)
             path = os.path.join(tmp, f"t07-icon{scale}x.png")
             shot(path)
+            # The window geometry must be read while it is still mapped.
+            bx, by, bw, bh = window_box()
             close_notification(conn, nid)
             wait_no_window("dunst-in-gtk t07")
-            heights[scale] = icon_band_heights(path)
+            heights[scale] = icon_band_height(path, xmax=bw, ymax=bh, origin=(bx, by))
         finally:
             daemon.stop()
     h1, h2 = heights.get("1", 0), heights.get("2", 0)
     if h1 < 15:
-        fail(f"no firefox icon pixels at scale 1 (band={h1})")
+        fail(f"no icon pixels at scale 1 (band={h1})")
     if not (h2 >= 1.6 * h1 and h2 >= h1 + 15):
         fail(f"icon should render ~2x physical size at scale 2, got {h1} -> {h2}")
     pass_(f"icon renders at 2x physical size under GDK_SCALE=2 ({h1}px -> {h2}px)")
 
 
 def test_monitor_selection(binary, conn):
-    """resolve_monitor paths on a single screen (ticket 03 remainder):
-    monitor number, out-of-range fallback, monitor name, follow=mouse.
+    """resolve_monitor paths: monitor number, out-of-range fallback,
+    monitor name, follow=mouse.
 
-    Xvfb exposes RandR < 1.5, so a real dual-monitor layout cannot be
-    created here (xrandr --setmonitor is a no-op); every selection path is
-    exercised and must land on the single screen and place the window at
-    the configured top-left origin.
+    Under Xvfb the RandR version is < 1.5, so no real dual-monitor layout can
+    be created; every selection path is exercised and must land on the
+    top-left corner of *some* monitor (on the real session: the selected one).
+    The name case pins a connector reported by xrandr.
     """
     log("== test: monitor selection paths (single screen) ==")
     tmp = os.environ.get("TMPDIR", "/tmp")
+    # NOTE: the placeholder is the whole key=value line; a previous version
+    # had "monitor = {monitor}" here while the cases already carried
+    # "monitor = ...", producing "monitor = monitor = 0" — the value failed to
+    # parse and every case silently ran with the default monitor, so the name
+    # path was never actually exercised.
     base = """
 [global]
 origin = top-left
 offset = (10, 10)
 width = (200, 400)
-monitor = {monitor}
+{monitor}
 """
     cases = [
         ("number-0", "monitor = 0"),
-        ("number-oob", "monitor = 99"),  # falls back to the only screen
+        ("number-oob", "monitor = 99"),  # falls back to the primary monitor
         ("follow-mouse", "follow = mouse"),
     ]
     for name, mon_line in cases:
@@ -555,18 +658,27 @@ monitor = {monitor}
             if len(geoms) != 1:
                 fail(f"monitor test {name}: window missing")
             x, y, w, h = geoms[0]
-            # 200-wide window at top-left with offset 10 on the only screen.
-            if (x, y) != (10, 10):
-                fail(f"monitor test {name}: expected (10, 10), got {geoms}")
+            if w != 200:
+                fail(f"monitor test {name}: expected width 200, got {geoms}")
+            # The selection paths (number / out-of-range / follow=mouse) may
+            # resolve to any monitor; require the top-left corner of *some*
+            # monitor plus the configured offset.
+            mon = monitor_at_origin(x - 10, y - 10)
+            if mon is None:
+                fail(f"monitor test {name}: expected top-left of a monitor, got {geoms}")
             close_notification(conn, nid)
             wait_no_window("dunst-in-gtk mon")
         finally:
             daemon.stop()
-    # Monitor *name*: xrandr reports the screen as "screen" on Xvfb; the
-    # config may also name the connector. "screen" must resolve.
+    # Monitor *name*: pin the config to a connector xrandr reports and
+    # require the window on exactly that monitor.
+    mons = xrandr_monitors()
+    if not mons:
+        fail("no monitors reported by xrandr")
+    mon_name, mon_x, mon_y, _mon_w, _mon_h, _primary = mons[0]
     cfg_path = os.path.join(tmp, "dig-mon-name-dunstrc")
     with open(cfg_path, "w") as f:
-        f.write(base.format(monitor="monitor = screen"))
+        f.write(base.format(monitor=f"monitor = {mon_name}"))
     daemon = Daemon(binary, os.path.join(tmp, "dig-mon-name.log"))
     try:
         daemon.start(args=["-config", cfg_path])
@@ -574,13 +686,13 @@ monitor = {monitor}
             fail("monitor-name daemon did not acquire the bus name")
         nid = notify(conn, "mon", "name", "body", 5000)
         geoms = wait_window_geometry("dunst-in-gtk mon", 1)
-        if len(geoms) != 1 or geoms[0][:2] != (10, 10):
-            fail(f"monitor name 'screen': expected (10,10), got {geoms}")
+        if len(geoms) != 1 or geoms[0][:2] != (mon_x + 10, mon_y + 10):
+            fail(f"monitor name {mon_name!r}: expected ({mon_x + 10},{mon_y + 10}), got {geoms}")
         close_notification(conn, nid)
         wait_no_window("dunst-in-gtk mon")
     finally:
         daemon.stop()
-    pass_("monitor number / out-of-range / name / follow=mouse all resolve to the screen")
+    pass_(f"monitor number / out-of-range / name({mon_name}) / follow=mouse all resolve")
 
 
 
