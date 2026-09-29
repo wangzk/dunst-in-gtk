@@ -521,7 +521,11 @@ fn parse_size(v: &str) -> Result<SizeSpec, String> {
         let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
             return Err(format!("expected (min, max), got {v:?}"));
         };
-        return Ok(SizeSpec::Range(parse_int(a)?, parse_int(b)?));
+        let (min, max) = (parse_int(a)?, parse_int(b)?);
+        if min > max {
+            return Err(format!("size range minimum {min} exceeds maximum {max}"));
+        }
+        return Ok(SizeSpec::Range(min, max));
     }
     Ok(SizeSpec::Constant(parse_int(v)?))
 }
@@ -860,6 +864,14 @@ mod tests {
     fn malformed_values_warn() {
         let (_, warnings) = parse("[global]\nframe_width = notanumber\n");
         assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn inverted_size_range_is_rejected_with_a_warning() {
+        let (c, warnings) = parse("[global]\nwidth = (1000, 500)\n");
+        assert!(!warnings.is_empty(), "{warnings:?}");
+        // The bad value is dropped; the default width spec stays.
+        assert_eq!(c.global.width, SizeSpec::Constant(0));
     }
 
     #[test]

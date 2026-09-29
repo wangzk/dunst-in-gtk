@@ -54,6 +54,10 @@ pub fn resolve_size(
         SizeSpec::Range(min, max) => {
             let min = min.max(0);
             let max = if max <= 0 { i32::MAX } else { max };
+            // Defensive: a malformed spec (min > max) must never panic in
+            // `clamp`; swap instead (parse_size rejects it, but this fn is
+            // also reachable with hand-built specs).
+            let (min, max) = if min <= max { (min, max) } else { (max, min) };
             natural.clamp(min, max)
         }
     }
@@ -217,5 +221,8 @@ mod tests {
         assert_eq!(resolve_size(SizeSpec::Percent(0.5), 120, 1920), 960);
         // Percent clamped by range when combined via parse? percent base:
         assert_eq!(resolve_size(SizeSpec::Percent(0.05), 120, 1920), 96);
+        // Malformed range (min > max) must swap, not panic.
+        assert_eq!(resolve_size(SizeSpec::Range(300, 100), 500, 1920), 300);
+        assert_eq!(resolve_size(SizeSpec::Range(300, 100), 50, 1920), 100);
     }
 }
