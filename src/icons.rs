@@ -77,7 +77,15 @@ pub fn icon_widget(
 }
 
 fn theme_icon(name: &str, app_name: &str, style: &WindowStyle) -> Option<gtk::Widget> {
-    let theme = gtk::IconTheme::new();
+    // Use the *screen's* icon theme — the one GTK widgets use, which honors
+    // the user's `gtk-icon-theme-name` and the standard search paths.
+    // gtk_icon_theme_new() creates a detached theme with no theme name: on a
+    // real session it failed to resolve ordinary icons (a theme icon name
+    // rendered as a fallback glyph even though loading the same icon by file
+    // path worked).
+    let theme = gtk::gdk::Screen::default()
+        .and_then(|screen| gtk::IconTheme::for_screen(&screen))
+        .unwrap_or_else(gtk::IconTheme::new);
     let resolved = if theme.has_icon(name) {
         name
     } else if theme.has_icon("dialog-information") {
@@ -92,6 +100,17 @@ fn theme_icon(name: &str, app_name: &str, style: &WindowStyle) -> Option<gtk::Wi
     if let Some(size) = target_size(style) {
         image.set_pixel_size(size);
     }
+    log::debug!(
+        "theme icon {name:?} -> {resolved:?} pixel-size {:?} file {:?}",
+        target_size(style),
+        theme
+            .lookup_icon(
+                resolved,
+                target_size(style).unwrap_or(48),
+                gtk::IconLookupFlags::empty()
+            )
+            .and_then(|info| info.filename())
+    );
     image.set_valign(gtk::Align::Center);
     Some(image.upcast())
 }
