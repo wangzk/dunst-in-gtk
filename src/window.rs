@@ -1,19 +1,35 @@
 //! A single notification window (GTK3).
 //!
-//! Each notification gets its own `GtkWindow` (dunst's architecture). GTK3
-//! still ships the classic toplevel hints as first-class APIs, so everything
-//! the X11 layer used to do by hand in the GTK4 version is now official:
+//! Each notification gets its own `GtkWindow` (dunst's architecture). The
+//! window is made **override-redirect** before mapping so no window manager
+//! manages it: i3 otherwise inserts a new window into the *focused*
+//! workspace and relocates it when the requested coordinates are on another
+//! output, which makes it impossible to show a notification on a
+//! non-focused monitor (see `apply_geometry`).
+//!
+//! GTK3 still ships the classic toplevel hints as first-class APIs, so the
+//! hints the GTK4 version set by hand are now official — they remain useful
+//! as a description if the window is not override-redirect (non-X11):
 //!   - `set_type_hint(WindowTypeHint::Notification)`
 //!   - `set_accept_focus(false)` + `set_focus_on_map(false)` — never steal
 //!     the keyboard focus (maps to WM_HINTS input=False)
 //!   - `set_keep_above(true)` / `set_skip_taskbar_hint(true)` /
 //!     `set_skip_pager_hint(true)`
 //!   - `move_(x, y)` for corner placement
+//!
+//! Sizing: GTK sizes a non-resizable toplevel at `max(default_size,
+//! natural_size)`, so the content's natural width is capped explicitly
+//! (`set_layout_width`) — otherwise a long unwrappable line makes the window
+//! wider than the `width` spec and it straddles two monitors. Measurement
+//! only works once the widgets are visible, hence the `show_all` on the
+//! content in `new()` (the toplevel itself stays hidden until placement).
+//!
 //! HiDPI is handled by GTK's per-window scale factor (logical coordinates).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use glib::translate::ToGlibPtr;
 use gtk::pango;
 use gtk::prelude::*;
 
@@ -304,6 +320,14 @@ pub struct NotificationWindow {
     content: gtk::Widget,
     /// The time label floating at the window's top-right corner.
     time_label: gtk::Label,
+    /// The screen this window's CSS provider is registered on (removed on
+    /// destroy; see `css_provider`).
+    screen: gtk::gdk::Screen,
+    /// The screen-level CSS provider for this window's style. Kept here so
+    /// it can be replaced on style updates and removed on destroy — screen
+    /// providers are never freed automatically and would accumulate over
+    /// the daemon's lifetime.
+    css_provider: RefCell<gtk::CssProvider>,
 }
 
 impl NotificationWindow {
@@ -352,17 +376,16 @@ impl NotificationWindow {
         // with a minimal C program). Screen-level providers work; a fresh
         // provider per notification wins over earlier ones (same priority,
         // later addition wins in GTK3), so style updates apply.
-        if let Some(screen) = gtk::gdk::Screen::default() {
-            let css = gtk::CssProvider::new();
-            if let Err(e) = css.load_from_data(style_css(style).as_bytes()) {
-                log::warn!("CSS load error: {e}");
-            }
-            gtk::StyleContext::add_provider_for_screen(
-                &screen,
-                &css,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
+        let screen = gtk::gdk::Screen::default().expect("default screen at window creation");
+        let css_provider = gtk::CssProvider::new();
+        if let Err(e) = css_provider.load_from_data(style_css(style).as_bytes()) {
+            log::warn!("CSS load error: {e}");
         }
+        gtk::StyleContext::add_provider_for_screen(
+            &screen,
+            &css_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
 
         let font_attrs = font_attr_list(&style.font);
 
@@ -374,6 +397,13 @@ impl NotificationWindow {
         summary_label.set_markup(&render_text(style.markup, &content.summary));
         summary_label.set_halign(align_of(style.alignment));
         summary_label.set_attributes(Some(&summary_attrs));
+        // Wrap + ellipsize like the body: an unwrapped single-line summary
+        // drives the natural width past the configured `width` spec, and a
+        // non-resizable GTK3 window then renders at its (much wider)
+        // natural size, ignoring the geometry the layout computed — the
+        // window ends up straddling monitors instead of sitting inside one.
+        summary_label.set_wrap(style.word_wrap);
+        summary_label.set_ellipsize(ellipsize_of(style.ellipsize));
 
         let body_label = gtk::Label::new(None);
         body_label.set_markup(&render_text(style.markup, &content.body));
@@ -428,6 +458,16 @@ impl NotificationWindow {
         let overlay = gtk::Overlay::new();
         overlay.add(&child);
         overlay.add_overlay(&time_label);
+        // Make the content measurable without mapping the window:
+        // preferred_size() only returns real values once the widgets are
+        // marked visible (it reports 0x0 while they are hidden, which used
+        // to make relayout measure 1x1 and fall back to pure guesswork).
+        // The toplevel stays hidden until apply_geometry maps it at its
+        // final position.
+        overlay.show_all();
+        // show_all() forces the time label visible again; re-apply its
+        // intended visibility (hidden when the timestamp is unrenderable).
+        apply_timestamp(&time_label, content.timestamp);
         // The label never takes input: hover/click fall through.
         overlay.set_overlay_pass_through(&time_label, true);
         window.add(&overlay);
@@ -450,6 +490,8 @@ impl NotificationWindow {
             popover: RefCell::new(None),
             content: content_widget,
             time_label,
+            screen,
+            css_provider: RefCell::new(css_provider),
         };
         nw.set_icon_and_progress(content, style);
 
@@ -556,17 +598,32 @@ impl NotificationWindow {
     /// Close the window without emitting close-request (daemon-initiated).
     /// The caller emits `NotificationClosed` itself.
     pub fn destroy(&self) {
+        // Unregister this window's screen-level CSS provider first:
+        // screen providers are strong references that GTK never drops, so
+        // leaving it registered would leak one provider per notification
+        // over the daemon's lifetime.
+        gtk::StyleContext::remove_provider_for_screen(&self.screen, &*self.css_provider.borrow());
         unsafe { self.window.destroy() };
     }
 
     /// Update the content in place (replaces_id) and re-apply the style.
     pub fn update_content(&self, content: &NotificationContent, style: &WindowStyle) {
-        let css = gtk::CssProvider::new();
-        css.load_from_data(style_css(style).as_bytes())
-            .expect("style CSS");
-        self.window
-            .style_context()
-            .add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        // Replace the screen-level provider (the only mechanism that works
+        // on this GTK3, see `new`): remove the old one, then add a fresh
+        // provider with the new CSS. Keeps exactly one provider per live
+        // window.
+        let new_css = gtk::CssProvider::new();
+        if let Err(e) = new_css.load_from_data(style_css(style).as_bytes()) {
+            log::warn!("CSS load error on update: {e}");
+        }
+        gtk::StyleContext::add_provider_for_screen(
+            &self.screen,
+            &new_css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        gtk::StyleContext::remove_provider_for_screen(&self.screen, &*self.css_provider.borrow());
+        // Swap in the new provider as this window's active one.
+        *self.css_provider.borrow_mut() = new_css;
 
         // Fresh attribute lists per label: `font_attrs.clone()` would share
         // the underlying list, so inserting the summary's bold weight would
@@ -579,6 +636,9 @@ impl NotificationWindow {
         self.summary_label
             .set_markup(&render_text(style.markup, &content.summary));
         self.summary_label.set_halign(align_of(style.alignment));
+        self.summary_label.set_wrap(style.word_wrap);
+        self.summary_label
+            .set_ellipsize(ellipsize_of(style.ellipsize));
         self.body_label
             .set_markup(&render_text(style.markup, &content.body));
         self.body_label.set_halign(align_of(style.alignment));
@@ -643,15 +703,113 @@ impl NotificationWindow {
         nh.max(1)
     }
 
+    /// Cap the labels' natural width so the window really renders at the
+    /// layout-computed width. GTK3 sizes a non-resizable window at
+    /// `max(default_size, natural_size)`, so a long unwrappable line would
+    /// otherwise make the window render wider than the width spec — on a
+    /// multi-monitor setup the window then straddles two screens instead of
+    /// sitting inside one (verified on i3 with a rotated secondary monitor).
+    /// `max_width_chars` is the only mechanism that caps the natural size
+    /// (default size, size request and geometry hints are all overridden by
+    /// it).
+    ///
+    /// The char->pixel factor must come from the *configured* font (the
+    /// Pango attributes on the labels), not from the context's default font;
+    /// since the remaining error is a few percent (CJK glyphs, icon slot,
+    /// CSS box), the cap is then corrected iteratively against the measured
+    /// natural width.
+    pub fn set_layout_width(&self, width: i32, style: &WindowStyle) {
+        // Space the labels cannot use: horizontal CSS padding + border on
+        // both sides, plus the icon column when it sits left/right.
+        let overhead = 2 * (style.h_padding.max(0) + style.frame_width.max(0))
+            + if style.icons
+                && matches!(
+                    style.icon_position,
+                    IconPosition::Left | IconPosition::Right
+                )
+            {
+                style.max_icon_size.max(0) + style.text_icon_padding.max(0)
+            } else {
+                0
+            };
+        let budget = (width - overhead).max(1);
+        let desc = pango::FontDescription::from_string(&style.font);
+        let ctx = self.body_label.pango_context();
+        let metrics = ctx.metrics(Some(&desc), None);
+        // Pango returns 1/1024 px units; this is the font's average glyph
+        // width, which is what max-width-chars is multiplied by.
+        let avg = (metrics.approximate_char_width() as f64 / pango::SCALE as f64).max(1.0);
+
+        let mut chars = ((budget as f64 / avg).floor() as i32).max(1);
+        for _ in 0..4 {
+            self.summary_label.set_max_width_chars(chars);
+            self.body_label.set_max_width_chars(chars);
+            let natural = self.natural_size().0;
+            if natural <= width {
+                break;
+            }
+            // Shrink by the measured excess (plus one char of slack) and
+            // re-measure; converges in one or two rounds.
+            let reduce = (((natural - width) as f64 / avg).ceil() as i32) + 1;
+            let next = (chars - reduce).max(1);
+            if next == chars {
+                break;
+            }
+            chars = next;
+        }
+        log::debug!("set_layout_width({width}): overhead={overhead} avg={avg:.2} chars={chars}");
+    }
+
     /// Apply the final geometry (logical pixels; GTK handles HiDPI scaling).
     /// The first call shows the window; later calls (reflows) reposition
-    /// and resize via the official GTK3 window APIs.
+    /// and resize via the official GTK3 window APIs. `resize` is required
+    /// for reflows: `set_default_size` only affects a window that has not
+    /// been mapped yet, so an already-shown window would keep its old size.
     pub fn apply_geometry(&self, x: i32, y: i32, width: i32, height: i32) {
-        self.window.set_default_size(width.max(1), height.max(1));
+        let (w, h) = (width.max(1), height.max(1));
+        self.window.set_default_size(w, h);
         self.window.move_(x, y);
         if !self.presented.get() {
+            // Make the toplevel override-redirect before mapping: the WM
+            // must not manage notification windows. Without this, i3
+            // inserts the window into the *focused* workspace and, when the
+            // requested coordinates are on a different output, moves it
+            // there (manage.c stores the client geometry, then
+            // floating_enable -> floating_fix_coordinates remaps it onto
+            // the focused output), so notifications could never appear on a
+            // non-focused monitor. i3 explicitly skips override-redirect
+            // windows in manage_window() (attr->override_redirect), and GTK3
+            // itself uses OR windows for menus/tooltips, so input/redraw
+            // keep working. dunst does the same on X11.
+            //
+            // Ordering matters: realize() creates the GdkWindow (which is
+            // the only moment the X override-redirect attribute can be set),
+            // then the position is re-asserted (after realize it is a plain
+            // XMoveWindow, with no WM in between) and only then mapped.
+            self.window.realize();
+            // gdk_window_set_override_redirect() is X11-only; on other
+            // backends GTK ignores it (and cannot position windows anyway).
+            // NOTE: gdk_display_get_name() returns the *display string*
+            // (":0"), not the backend — the backend is the GType name, which
+            // is exactly how the gdk crate itself detects it.
+            let is_x11 = gtk::gdk::Display::default()
+                .map(|d| d.type_().name() == "GdkX11Display")
+                .unwrap_or(false);
+            if is_x11 {
+                if let Some(gdkwin) = self.window.window() {
+                    unsafe {
+                        // gboolean TRUE == 1 (glib-sys has no exported const).
+                        gdk_sys::gdk_window_set_override_redirect(gdkwin.to_glib_none().0, 1)
+                    };
+                }
+            } else {
+                log::debug!("non-X11 backend: window stays WM-managed");
+            }
+            self.window.move_(x, y);
             self.window.show_all();
             self.presented.set(true);
+        } else {
+            self.window.resize(w, h);
         }
     }
 }

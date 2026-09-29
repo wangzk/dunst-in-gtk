@@ -711,13 +711,20 @@ impl Daemon {
         }
 
         // Resolve sizes: width spec -> natural -> wrap height -> height spec.
+        // The label width cap must be applied before measuring the wrapped
+        // height, and the final window width only holds if the cap keeps the
+        // natural size at or below the resolved width (see
+        // NotificationWindow::set_layout_width).
         let mut resolved: Vec<(i32, i32)> = Vec::with_capacity(ordered.len());
-        for (id, _) in &ordered {
+        for (id, urgency) in &ordered {
             let (nw, _) = &self.windows[id];
             let (natural_w, _) = nw.natural_size();
             let w = resolve_size(cfg.global.width, natural_w, monitor.width);
+            let style = WindowStyle::from_config(cfg, *urgency);
+            nw.set_layout_width(w, &style);
             let natural_h_at_w = nw.height_for_width(w);
             let h = resolve_size(cfg.global.height, natural_h_at_w, monitor.height);
+            log::debug!("relayout id={id} natural_w={natural_w} w={w} h={h}");
             resolved.push((w, h));
         }
 
@@ -748,26 +755,34 @@ fn resolve_monitor(cfg: &Config) -> Option<MonitorGeometry> {
 
     let picked: Option<gdk::Monitor> = match cfg.global.follow {
         Follow::Mouse => {
-            // GTK3: pointer window via the default seat's pointer device.
-            let window = display
+            // Do NOT use gdk_device_get_window_at_position() here: the
+            // device handed out by default_seat().pointer() is GDK's
+            // virtual/master device ("Virtual core pointer"), and that
+            // function returns NULL for virtual devices — so `follow =
+            // mouse` always fell through to the fallback monitor and
+            // notifications appeared on monitors[0] regardless of the
+            // pointer. gdk_device_get_position() works for master devices;
+            // feed the coordinates to gdk_display_get_monitor_at_point().
+            let point = display
                 .default_seat()
                 .and_then(|seat| seat.pointer())
-                .and_then(|dev| dev.window_at_position().0);
-            match window {
-                Some(w) => display
-                    .monitor_at_window(&w)
-                    .or_else(|| monitors.first().cloned()),
-                None => monitors.first().cloned(),
+                .map(|dev| {
+                    let (_, x, y) = dev.position();
+                    (x, y)
+                });
+            match point {
+                Some((x, y)) => {
+                    log::debug!("follow=mouse: pointer at ({x},{y})");
+                    display.monitor_at_point(x, y)
+                }
+                None => None,
             }
         }
         // Keyboard-focus tracking is L2; fall back to the configured monitor.
         Follow::Keyboard | Follow::None => match &cfg.global.monitor {
             Monitor::Number(n) => {
                 let n = (*n).max(0) as usize;
-                monitors
-                    .get(n)
-                    .cloned()
-                    .or_else(|| monitors.first().cloned())
+                monitors.get(n).cloned()
             }
             Monitor::Name(name) => monitors
                 .iter()
@@ -776,10 +791,15 @@ fn resolve_monitor(cfg: &Config) -> Option<MonitorGeometry> {
                         .map(|c| c.contains(name.as_str()))
                         .unwrap_or(false)
                 })
-                .cloned()
-                .or_else(|| monitors.first().cloned()),
+                .cloned(),
         },
     };
+    // Fallback: the primary monitor, not blindly GDK index 0 (index order is
+    // whatever the backend reports — on this machine index 0 happened to be
+    // the primary, but that is not guaranteed).
+    let picked = picked
+        .or_else(|| monitors.iter().find(|m| m.is_primary()).cloned())
+        .or_else(|| monitors.first().cloned());
 
     picked.map(|m| {
         let g = m.geometry();

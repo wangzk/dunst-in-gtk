@@ -7,6 +7,7 @@ description = "A dunst-compatible notification daemon rendering notifications wi
 [dependencies]
 gtk = "0.18"
 glib = "0.18"
+gdk-sys = "0.18"
 zbus = "5"
 async-channel = "2"
 
