@@ -301,6 +301,23 @@ fn apply_timestamp(label: &gtk::Label, timestamp: u64) {
 /// natural let it).
 const MAX_WRAP_LINES: i32 = 5;
 
+// ---- Fade animation (official APIs: set_opacity + add_tick_callback) ----
+
+/// Fade-in duration, milliseconds.
+const FADE_IN_MS: i64 = 450;
+/// Fade-out duration, milliseconds.
+const FADE_OUT_MS: i64 = 350;
+
+/// Cubic ease-out: fast start, gentle landing (fade-in).
+fn ease_out_cubic(t: f64) -> f64 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Cubic ease-in: slow start, accelerating exit (fade-out).
+fn ease_in_cubic(t: f64) -> f64 {
+    t.powi(3)
+}
+
 pub struct NotificationWindow {
     window: gtk::Window,
     summary_label: gtk::Label,
@@ -319,6 +336,9 @@ pub struct NotificationWindow {
     on_event: EventCb,
     /// Whether the window has been shown yet.
     presented: Cell<bool>,
+    /// Whether an ARGB visual was available (compositor present): opacity
+    /// animation only has a visual effect on such windows.
+    has_argb: Cell<bool>,
     /// Whether the pointer is currently inside the window (shared with the
     /// enter/leave callbacks).
     hovered: Rc<Cell<bool>>,
@@ -380,10 +400,12 @@ impl NotificationWindow {
         // used instead (GTK pre-mixes the rgba onto it — still readable).
         // app_paintable tells GTK not to paint the window background so
         // the alpha is not flattened by a theme background fill.
+        let mut has_argb = false;
         if let Some(screen) = gtk::gdk::Screen::default() {
             if let Some(visual) = screen.rgba_visual() {
                 window.set_visual(Some(&visual));
                 window.set_app_paintable(true);
+                has_argb = true;
                 log::debug!("window uses ARGB visual (compositor present)");
             }
         }
@@ -538,6 +560,7 @@ impl NotificationWindow {
             actions,
             on_event,
             presented: Cell::new(false),
+            has_argb: Cell::new(has_argb),
             hovered: Rc::clone(&hovered),
             popover: RefCell::new(None),
             content: content_widget,
@@ -648,15 +671,74 @@ impl NotificationWindow {
         self.popover.replace(Some(menu));
     }
 
-    /// Close the window without emitting close-request (daemon-initiated).
-    /// The caller emits `NotificationClosed` itself.
-    pub fn destroy(&self) {
-        // Unregister this window's screen-level CSS provider first:
-        // screen providers are strong references that GTK never drops, so
-        // leaving it registered would leak one provider per notification
-        // over the daemon's lifetime.
-        gtk::StyleContext::remove_provider_for_screen(&self.screen, &*self.css_provider.borrow());
-        unsafe { self.window.destroy() };
+    /// Animate the window opacity from `from` to `to` over `duration_ms`
+    /// using a tick callback (official GTK3 frame-clock API: the callback
+    /// fires in sync with the frame clock, i.e. once per displayed frame —
+    /// 60fps on a 60Hz monitor). Non-linear easing: cubic ease-out when
+    /// fading in, cubic ease-in when fading out. `on_done` runs once at the
+    /// end (always, even when animation is skipped or fails to start).
+    fn start_fade(
+        &self,
+        from: f64,
+        to: f64,
+        duration_ms: i64,
+        on_done: Option<Box<dyn Fn() + 'static>>,
+    ) {
+        let done = RefCell::new(on_done);
+        let finish = move |done: &RefCell<Option<Box<dyn Fn() + 'static>>>| {
+            if let Some(f) = done.borrow_mut().take() {
+                f();
+            }
+        };
+        // Without an ARGB visual (no compositor) opacity has no visible
+        // effect — skip straight to the end state.
+        if !self.has_argb.get() {
+            self.window.set_opacity(to);
+            finish(&done);
+            return;
+        }
+        let Some(clock) = self.window.frame_clock() else {
+            // No frame clock yet: cannot animate; jump to the target.
+            self.window.set_opacity(to);
+            finish(&done);
+            return;
+        };
+        let start = clock.frame_time(); // microseconds
+        let window = self.window.clone();
+        self.window.add_tick_callback(move |_, clock| {
+            let elapsed_us = (clock.frame_time() - start).max(0) as f64;
+            let t = (elapsed_us / (duration_ms as f64 * 1000.0)).clamp(0.0, 1.0);
+            let eased = if to > from {
+                ease_out_cubic(t)
+            } else {
+                ease_in_cubic(t)
+            };
+            window.set_opacity(from + (to - from) * eased);
+            if t >= 1.0 {
+                finish(&done);
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
+
+    /// Fade the window out (cubic ease-in), then destroy it. The daemon
+    /// calls this instead of `destroy()` so notifications disappear with
+    /// the same animation they appear with. Bookkeeping stays with the
+    /// caller; the window dies on its own once the animation completes.
+    pub fn fade_out_destroy(&self) {
+        let window = self.window.clone();
+        let screen = self.screen.clone();
+        let provider = self.css_provider.borrow().clone();
+        let on_done: Box<dyn Fn() + 'static> = Box::new(move || {
+            gtk::StyleContext::remove_provider_for_screen(&screen, &provider);
+            unsafe { window.destroy() };
+        });
+        // Fade out from the *current* opacity so a close during fade-in
+        // does not jump to full opacity first.
+        let from = self.window.opacity();
+        self.start_fade(from, 0.0, FADE_OUT_MS, Some(on_done));
     }
 
     /// Update the content in place (replaces_id) and re-apply the style.
@@ -873,8 +955,14 @@ impl NotificationWindow {
                 log::debug!("non-X11 backend: window stays WM-managed");
             }
             self.window.move_(x, y);
+            // Fade in: start fully transparent *before* mapping so the
+            // first presented frame is invisible, then animate to opaque.
+            self.window.set_opacity(0.0);
             self.window.show_all();
             self.presented.set(true);
+            // show_all maps the window (creating its frame clock), so the
+            // tick callback can start syncing to frames right away.
+            self.start_fade(0.0, 1.0, FADE_IN_MS, None);
         } else {
             self.window.resize(w, h);
         }
@@ -1020,5 +1108,27 @@ mod tests {
     #[test]
     fn format_time_hides_missing_timestamp() {
         assert_eq!(format_time(0), None);
+    }
+
+    #[test]
+    fn easing_is_non_linear() {
+        // Halfway through the timeline, ease-out is already past 80%
+        // (fast start) and ease-in is under 20% (slow start) — neither is
+        // the linear 0.5.
+        assert!((ease_out_cubic(0.5) - 0.875).abs() < 1e-9);
+        assert!((ease_in_cubic(0.5) - 0.125).abs() < 1e-9);
+        // Endpoints are exact.
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        assert_eq!(ease_in_cubic(0.0), 0.0);
+        assert_eq!(ease_in_cubic(1.0), 1.0);
+        // Monotonic over the timeline.
+        let mut prev = 0.0;
+        for i in 1..=100 {
+            let t = i as f64 / 100.0;
+            let v = ease_out_cubic(t);
+            assert!(v >= prev);
+            prev = v;
+        }
     }
 }

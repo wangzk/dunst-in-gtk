@@ -667,7 +667,9 @@ impl Daemon {
                 timestamp: now_secs(),
                 client: pending.client,
             });
-            nw.destroy();
+            // Fade out (then destroy) instead of vanishing instantly; the
+            // daemon's bookkeeping above is already complete.
+            nw.fade_out_destroy();
             self.counters.displayed.fetch_sub(1, Ordering::Relaxed);
             // Promote the oldest waiting notification, if any.
             if let Some(p) = self.queue.display_closed() {
