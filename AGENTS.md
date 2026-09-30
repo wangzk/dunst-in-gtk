@@ -1,5 +1,10 @@
 # AGENTS.md
 
+
+## 编程规范
+
+在使用GTK+3的API前先查阅GTK+3的官方文档，充分理解API的行为后再开始编程。不要主观臆断其行为。
+
 ## Agent skills
 
 ### Issue tracker

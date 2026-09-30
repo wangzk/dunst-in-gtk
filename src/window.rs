@@ -168,6 +168,11 @@ window.notification label {{
 }}
 window.notification label.time {{
     color: #888888;
+    font-weight: bold;
+}}
+window.notification label.app {{
+    color: #888888;
+    font-weight: bold;
 }}
 {progress}"#
     )
@@ -284,11 +289,6 @@ fn apply_timestamp(label: &gtk::Label, timestamp: u64) {
     }
 }
 
-/// Distance of the time label from the window's top and right edges
-/// (logical pixels), applied as GtkOverlay margins.
-const TIME_LABEL_MARGIN_TOP: i32 = 6;
-const TIME_LABEL_MARGIN_END: i32 = 8;
-
 /// Maximum number of text lines per label (summary/body) when word wrap is
 /// on; text beyond this is ellipsized on the last visible line.
 ///
@@ -332,6 +332,12 @@ pub struct NotificationWindow {
     content: gtk::Widget,
     /// The time label floating at the window's top-right corner.
     time_label: gtk::Label,
+    /// The app-name label floating at the window's top-left corner
+    /// (gray italic). Hidden when the app name is empty. Configured once
+    /// at construction: the app name never changes for a window
+    /// (replaces_id keeps the same client).
+    #[allow(dead_code)]
+    app_label: gtk::Label,
     /// The screen this window's CSS provider is registered on (removed on
     /// destroy; see `css_provider`).
     screen: gtk::gdk::Screen,
@@ -430,7 +436,42 @@ impl NotificationWindow {
         }
         body_label.set_attributes(Some(&font_attrs));
 
-        // Text column: summary, body, then the progress-bar slot.
+        // Header row: the app name (gray italic, left) and the timestamp
+        // (gray, right). A real row in the layout — not overlay children —
+        // so the labels can never overlap the summary text; a floating
+        // overlay pinned to the top corners sat on top of the summary.
+        let time_label = gtk::Label::new(None);
+        time_label.style_context().add_class("time");
+        let time_attrs = font_attr_list(&style.font);
+        time_attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+        time_label.set_attributes(Some(&time_attrs));
+        time_label.set_halign(gtk::Align::End);
+        apply_timestamp(&time_label, content.timestamp);
+
+        let app_label = gtk::Label::new(None);
+        app_label.style_context().add_class("app");
+        let app_attrs = font_attr_list(&style.font);
+        // Bold via a Pango attribute like the summary label: it wins over
+        // the theme and works even where CSS font-weight is ignored.
+        app_attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+        app_label.set_attributes(Some(&app_attrs));
+        app_label.set_halign(gtk::Align::Start);
+        app_label.set_ellipsize(pango::EllipsizeMode::End);
+        app_label.set_single_line_mode(true);
+        if app_name.is_empty() {
+            app_label.hide();
+        } else {
+            app_label.set_text(app_name);
+        }
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header.pack_start(&app_label, true, false, 0);
+        header.pack_end(&time_label, false, false, 0);
+
+        // Text column: summary, body, then the progress-bar slot. It stays
+        // non-expanding (natural width) inside the icon row — expanding it
+        // would make the labels' configured halign apply across the whole
+        // window width (everything visibly centered).
         let text_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
         text_box.pack_start(&summary_label, false, false, 0);
         text_box.pack_start(&body_label, false, false, 0);
@@ -439,7 +480,7 @@ impl NotificationWindow {
 
         // Icon slot next to (or above) the text, per `icon_position`.
         let icon_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let child: gtk::Widget = if style.icons && style.icon_position != IconPosition::Off {
+        let inner: gtk::Widget = if style.icons && style.icon_position != IconPosition::Off {
             let orientation = match style.icon_position {
                 IconPosition::Left | IconPosition::Right => gtk::Orientation::Horizontal,
                 IconPosition::Top | IconPosition::Off => gtk::Orientation::Vertical,
@@ -452,43 +493,36 @@ impl NotificationWindow {
                 content_box.pack_start(&icon_slot, false, false, 0);
                 content_box.pack_start(&text_box, false, false, 0);
             }
-            content_box.style_context().add_class("notification");
             content_box.upcast()
         } else {
-            text_box.style_context().add_class("notification");
             text_box.upcast()
         };
-        // The time label floats at the top-right corner as an overlay
-        // child (it does not affect the window's natural size). GtkOverlay
-        // positions overlay children by their halign/valign plus margins,
-        // so pinning it with End/Start is stable across reflows — unlike a
-        // manual size_allocate, which the overlay's next allocation clobbers
-        // (the label then reverts to fill/center).
-        let time_label = gtk::Label::new(None);
-        time_label.style_context().add_class("time");
-        time_label.set_attributes(Some(&font_attrs));
-        time_label.set_halign(gtk::Align::End);
-        time_label.set_valign(gtk::Align::Start);
-        time_label.set_margin_top(TIME_LABEL_MARGIN_TOP);
-        time_label.set_margin_end(TIME_LABEL_MARGIN_END);
-        apply_timestamp(&time_label, content.timestamp);
-
-        let overlay = gtk::Overlay::new();
-        overlay.add(&child);
-        overlay.add_overlay(&time_label);
+        // Top-level vertical layout: the header row first, then the icon +
+        // text content. The outer box is the window child and fills the
+        // window width (default halign fill), so the header spans edge to
+        // edge (app name left, time right) while `inner` keeps its original
+        // natural-width layout below it. Both header labels hidden -> the
+        // header gets no allocation (0 height, no spacing gap).
+        let main_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        main_box.pack_start(&header, false, false, 0);
+        main_box.pack_start(&inner, false, false, 0);
+        main_box.style_context().add_class("notification");
+        let child: gtk::Widget = main_box.upcast();
         // Make the content measurable without mapping the window:
         // preferred_size() only returns real values once the widgets are
         // marked visible (it reports 0x0 while they are hidden, which used
         // to make relayout measure 1x1 and fall back to pure guesswork).
         // The toplevel stays hidden until apply_geometry maps it at its
         // final position.
-        overlay.show_all();
-        // show_all() forces the time label visible again; re-apply its
-        // intended visibility (hidden when the timestamp is unrenderable).
+        child.show_all();
+        // show_all() forces both header labels visible again; re-apply
+        // their intended visibility (hidden when the timestamp is
+        // unrenderable or the app name empty).
         apply_timestamp(&time_label, content.timestamp);
-        // The label never takes input: hover/click fall through.
-        overlay.set_overlay_pass_through(&time_label, true);
-        window.add(&overlay);
+        if app_name.is_empty() {
+            app_label.hide();
+        }
+        window.add(&child);
         let content_widget: gtk::Widget = child.clone().upcast();
 
         let hovered = Rc::new(Cell::new(false));
@@ -508,6 +542,7 @@ impl NotificationWindow {
             popover: RefCell::new(None),
             content: content_widget,
             time_label,
+            app_label,
             screen,
             css_provider: RefCell::new(css_provider),
         };
@@ -672,7 +707,11 @@ impl NotificationWindow {
         } else {
             -1
         });
-        self.time_label.set_attributes(Some(&font_attrs));
+        // The time label stays bold across style updates (own attribute
+        // list, never shared with the regular-weight body font attrs).
+        let time_attrs = font_attr_list(&style.font);
+        time_attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+        self.time_label.set_attributes(Some(&time_attrs));
         apply_timestamp(&self.time_label, content.timestamp);
         self.set_icon_and_progress(content, style);
     }
@@ -969,10 +1008,13 @@ mod tests {
     }
 
     #[test]
-    fn time_label_css_is_light_gray() {
+    fn header_labels_css_is_gray_bold() {
         let css = style_css(&style());
         assert!(css.contains("label.time"), "{css}");
+        assert!(css.contains("label.app"), "{css}");
         assert!(css.contains("#888888"), "{css}");
+        assert!(css.contains("font-weight: bold"), "{css}");
+        assert!(!css.contains("font-style"), "{css}");
     }
 
     #[test]
