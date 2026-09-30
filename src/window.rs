@@ -289,6 +289,18 @@ fn apply_timestamp(label: &gtk::Label, timestamp: u64) {
 const TIME_LABEL_MARGIN_TOP: i32 = 6;
 const TIME_LABEL_MARGIN_END: i32 = 8;
 
+/// Maximum number of text lines per label (summary/body) when word wrap is
+/// on; text beyond this is ellipsized on the last visible line.
+///
+/// GTK3 quirk (verified empirically, see `examples/label_probe.rs`): setting
+/// both `wrap` and `ellipsize` on a GtkLabel *without* `lines` degrades to a
+/// single ellipsized line — the label never wraps, so long notification
+/// bodies were shown as "...content...". `lines` restores real wrapping with
+/// a cap: the label wraps up to N lines and ellipsizes the Nth. The window
+/// height then grows with the wrapped content (height specs `(min, max)` /
+/// natural let it).
+const MAX_WRAP_LINES: i32 = 5;
+
 pub struct NotificationWindow {
     window: gtk::Window,
     summary_label: gtk::Label,
@@ -404,12 +416,18 @@ impl NotificationWindow {
         // window ends up straddling monitors instead of sitting inside one.
         summary_label.set_wrap(style.word_wrap);
         summary_label.set_ellipsize(ellipsize_of(style.ellipsize));
+        if style.word_wrap {
+            summary_label.set_lines(MAX_WRAP_LINES);
+        }
 
         let body_label = gtk::Label::new(None);
         body_label.set_markup(&render_text(style.markup, &content.body));
         body_label.set_halign(align_of(style.alignment));
         body_label.set_wrap(style.word_wrap);
         body_label.set_ellipsize(ellipsize_of(style.ellipsize));
+        if style.word_wrap {
+            body_label.set_lines(MAX_WRAP_LINES);
+        }
         body_label.set_attributes(Some(&font_attrs));
 
         // Text column: summary, body, then the progress-bar slot.
@@ -639,11 +657,21 @@ impl NotificationWindow {
         self.summary_label.set_wrap(style.word_wrap);
         self.summary_label
             .set_ellipsize(ellipsize_of(style.ellipsize));
+        self.summary_label.set_lines(if style.word_wrap {
+            MAX_WRAP_LINES
+        } else {
+            -1
+        });
         self.body_label
             .set_markup(&render_text(style.markup, &content.body));
         self.body_label.set_halign(align_of(style.alignment));
         self.body_label.set_wrap(style.word_wrap);
         self.body_label.set_ellipsize(ellipsize_of(style.ellipsize));
+        self.body_label.set_lines(if style.word_wrap {
+            MAX_WRAP_LINES
+        } else {
+            -1
+        });
         self.time_label.set_attributes(Some(&font_attrs));
         apply_timestamp(&self.time_label, content.timestamp);
         self.set_icon_and_progress(content, style);
